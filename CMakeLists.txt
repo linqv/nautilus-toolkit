@@ -178,6 +178,28 @@ if(BUILD_TESTING)
     target_link_libraries(test_polyglot PRIVATE ntk_warnings)
     add_test(NAME polyglot COMMAND test_polyglot)
 
+    add_executable(test_polyglot_zip_extract
+        tests/test_polyglot_zip_extract.c
+        src/core/polyglot.c
+        src/core/polyglot_zip_extract.c
+        src/core/path.c
+        src/core/strbuf.c
+    )
+    target_include_directories(test_polyglot_zip_extract PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    )
+    target_include_directories(test_polyglot_zip_extract SYSTEM PRIVATE
+        ${LIBARCHIVE_INCLUDE_DIRS}
+    )
+    target_compile_options(test_polyglot_zip_extract PRIVATE
+        ${LIBARCHIVE_CFLAGS_OTHER}
+    )
+    target_link_libraries(test_polyglot_zip_extract PRIVATE
+        ntk_warnings
+        ${LIBARCHIVE_LIBRARIES}
+    )
+    add_test(NAME polyglot_zip_extract COMMAND test_polyglot_zip_extract)
+
     add_executable(test_legacy_zip
         tests/test_legacy_zip.c
         src/core/exec7z.c
