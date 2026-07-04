@@ -6,6 +6,7 @@
 #include "../core/log.h"
 #include "../core/path.h"
 #include "../core/polyglot.h"
+#include "../core/polyglot_zip_extract.h"
 #include "../core/strbuf.h"
 
 #include <errno.h>
@@ -735,6 +736,50 @@ gpointer ui_gtk_worker_func(gpointer data) {
           polyglot_retry_attempted = 1;
           uint64_t zip_start = 0;
           char *fixed_path = NULL;
+          int find_rc = polyglot_find_zip_start(filepath, &zip_start);
+          if (find_rc == 1 && zip_start > 0 && !use_password) {
+            int fast_outdir_created_by_us = 0;
+            int fast_outdir_existed_before = 0;
+            if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                       &fast_outdir_created_by_us,
+                                       &fast_outdir_existed_before)) {
+              pipe_writef(write_fd, "# 检测到 polyglot ZIP，使用快速模式\n");
+              log_msg("Polyglot zero-copy ZIP fallback enabled: %s "
+                      "(zip_start=%llu, outdir_existed=%d)",
+                      filepath, (unsigned long long)zip_start,
+                      fast_outdir_existed_before);
+              StrBuf fast_out;
+              sb_init(&fast_out);
+              int fast_ec = polyglot_extract_plain_zip(
+                  filepath, zip_start, outdir, pipe_stream, start_pct,
+                  slot_size, &fast_out, filename, i + 1, total,
+                  &progress_floor);
+              if (fast_ec == 0) {
+                log_msg("Polyglot zero-copy ZIP fallback succeeded: %s",
+                        filepath);
+                success = 1;
+                success_count++;
+                sb_free(&fast_out);
+                sb_free(&out);
+                dir_snapshot_free(&outdir_snapshot);
+                break;
+              }
+              log_msg("Polyglot zero-copy ZIP fallback failed: %s",
+                      fast_out.data ? fast_out.data : "(no output)");
+              if (fast_outdir_created_by_us) {
+                remove_tree(outdir, parent);
+                free(outdir);
+                outdir = NULL;
+                outdir_with_password = 0;
+                outdir_needs_password_recheck = 0;
+              }
+              sb_free(&fast_out);
+            } else {
+              log_msg("Polyglot zero-copy ZIP fallback skipped: cannot prepare "
+                      "outdir");
+            }
+          }
+
           int fix_rc =
               polyglot_make_temp_fixed_zip(filepath, &fixed_path, &zip_start);
           if (fix_rc == 1 && fixed_path) {
