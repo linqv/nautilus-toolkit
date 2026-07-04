@@ -78,8 +78,9 @@ static void write_mp4_prefix(FILE *f) {
   fwrite("mdat", 1, 4, f);
 }
 
-static long write_zip_payload(FILE *f, const char *name, const char *text,
-                              uint16_t method) {
+static long write_zip_payload_with_flags(FILE *f, const char *name,
+                                         const char *text, uint16_t method,
+                                         uint16_t flags) {
   long zip_start = ftell(f);
   size_t name_len = strlen(name);
   size_t data_len = strlen(text);
@@ -88,7 +89,7 @@ static long write_zip_payload(FILE *f, const char *name, const char *text,
   long local_offset = ftell(f) - zip_start;
   put_le32(f, 0x04034b50U);
   put_le16(f, 20);
-  put_le16(f, 0);
+  put_le16(f, flags);
   put_le16(f, method);
   put_le16(f, 0);
   put_le16(f, 0);
@@ -104,7 +105,7 @@ static long write_zip_payload(FILE *f, const char *name, const char *text,
   put_le32(f, 0x02014b50U);
   put_le16(f, 20);
   put_le16(f, 20);
-  put_le16(f, 0);
+  put_le16(f, flags);
   put_le16(f, method);
   put_le16(f, 0);
   put_le16(f, 0);
@@ -132,10 +133,16 @@ static long write_zip_payload(FILE *f, const char *name, const char *text,
   return zip_start;
 }
 
+static long write_zip_payload(FILE *f, const char *name, const char *text,
+                              uint16_t method) {
+  return write_zip_payload_with_flags(f, name, text, method, 0);
+}
+
 typedef struct {
   const char *name;
   const char *text;
   uint16_t method;
+  uint16_t flags;
 } TestZipEntry;
 
 static long write_zip_payload_entries(FILE *f, const TestZipEntry *entries,
@@ -159,7 +166,7 @@ static long write_zip_payload_entries(FILE *f, const TestZipEntry *entries,
 
     put_le32(f, 0x04034b50U);
     put_le16(f, 20);
-    put_le16(f, 0);
+    put_le16(f, entries[i].flags);
     put_le16(f, entries[i].method);
     put_le16(f, 0);
     put_le16(f, 0);
@@ -178,7 +185,7 @@ static long write_zip_payload_entries(FILE *f, const TestZipEntry *entries,
     put_le32(f, 0x02014b50U);
     put_le16(f, 20);
     put_le16(f, 20);
-    put_le16(f, 0);
+    put_le16(f, entries[i].flags);
     put_le16(f, entries[i].method);
     put_le16(f, 0);
     put_le16(f, 0);
@@ -319,8 +326,8 @@ static void test_extracts_nested_file(void) {
 
 static void test_failed_extraction_removes_prior_outputs(void) {
   TestZipEntry entries[] = {
-      {"safe.txt", "safe\n", 0},
-      {"../evil.txt", "evil\n", 0},
+      {"safe.txt", "safe\n", 0, 0},
+      {"../evil.txt", "evil\n", 0, 0},
   };
   uint64_t zip_start = 0;
   char *src = make_polyglot_file_entries("rollback", entries, 2, &zip_start);
@@ -357,9 +364,117 @@ static void test_failed_extraction_removes_prior_outputs(void) {
   free(parent);
 }
 
+static void test_rejects_parent_traversal(void) {
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file("traversal", "../evil.txt", "evil\n", 0,
+                                 &zip_start);
+  char *outdir = make_temp_dir("traversal-out");
+  char outside[512];
+  snprintf(outside, sizeof(outside), "%s/../evil.txt", outdir);
+  unlink(outside);
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, NULL, 0.0, 100.0,
+                                      &out, "traversal.mp4", 1, 1, NULL);
+  if (rc == 0) {
+    fprintf(stderr, "parent traversal: expected nonzero, got 0\n");
+    failures++;
+  }
+  expect_path_missing("outside traversal file", outside);
+
+  rmdir(outdir);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(outdir);
+}
+
+static void test_rejects_absolute_path(void) {
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file("absolute", "/tmp/ntk-absolute-evil.txt",
+                                 "evil\n", 0, &zip_start);
+  char *outdir = make_temp_dir("absolute-out");
+  unlink("/tmp/ntk-absolute-evil.txt");
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, NULL, 0.0, 100.0,
+                                      &out, "absolute.mp4", 1, 1, NULL);
+  if (rc == 0) {
+    fprintf(stderr, "absolute path: expected nonzero, got 0\n");
+    failures++;
+  }
+  expect_path_missing("absolute file", "/tmp/ntk-absolute-evil.txt");
+
+  rmdir(outdir);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(outdir);
+}
+
+static void test_unsupported_method_fails_without_output(void) {
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file("unsupported", "unsupported.bin", "payload\n",
+                                 99, &zip_start);
+  char *outdir = make_temp_dir("unsupported-out");
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, NULL, 0.0, 100.0,
+                                      &out, "unsupported.mp4", 1, 1, NULL);
+  if (rc == 0) {
+    fprintf(stderr, "unsupported method: expected nonzero, got 0\n");
+    failures++;
+  }
+
+  char extracted[512];
+  snprintf(extracted, sizeof(extracted), "%s/unsupported.bin", outdir);
+  expect_path_missing("unsupported output file", extracted);
+
+  rmdir(outdir);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(outdir);
+}
+
+static void test_encrypted_flag_fails_without_output(void) {
+  TestZipEntry entries[] = {
+      {"secret.txt", "secret\n", 0, 1},
+  };
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file_entries("encrypted", entries, 1, &zip_start);
+  char *outdir = make_temp_dir("encrypted-out");
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, NULL, 0.0, 100.0,
+                                      &out, "encrypted.mp4", 1, 1, NULL);
+  if (rc == 0) {
+    fprintf(stderr, "encrypted flag: expected nonzero, got 0\n");
+    failures++;
+  }
+
+  char extracted[512];
+  snprintf(extracted, sizeof(extracted), "%s/secret.txt", outdir);
+  expect_path_missing("encrypted output file", extracted);
+
+  rmdir(outdir);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(outdir);
+}
+
 int main(void) {
   test_extracts_plain_zip_without_copy();
   test_extracts_nested_file();
   test_failed_extraction_removes_prior_outputs();
+  test_rejects_parent_traversal();
+  test_rejects_absolute_path();
+  test_unsupported_method_fails_without_output();
+  test_encrypted_flag_fails_without_output();
   return failures == 0 ? 0 : 1;
 }
