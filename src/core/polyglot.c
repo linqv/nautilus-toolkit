@@ -28,6 +28,10 @@ static uint32_t read_le32(const unsigned char *p) {
          ((uint32_t)p[3] << 24);
 }
 
+static uint16_t read_le16(const unsigned char *p) {
+  return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8);
+}
+
 static uint64_t read_le64(const unsigned char *p) {
   return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
          ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) |
@@ -67,6 +71,47 @@ static int seek_read(FILE *f, uint64_t pos, unsigned char *buf, size_t n) {
   if (fseeko(f, (off_t)pos, SEEK_SET) != 0)
     return -1;
   return fread(buf, 1, n, f) == n ? 0 : -1;
+}
+
+static int zip_method_looks_plausible(uint16_t method) {
+  return method == 0 || method == 1 || method == 6 || method == 8 ||
+         method == 9 || method == 12 || method == 14 || method == 93 ||
+         method == 95 || method == 98;
+}
+
+static int zip_local_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
+  static const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
+  unsigned char header[30];
+  if (!f || pos > file_size || file_size - pos < sizeof(header))
+    return 0;
+  if (seek_read(f, pos, header, sizeof(header)) != 0)
+    return 0;
+  if (memcmp(header, sig_local, sizeof(sig_local)) != 0)
+    return 0;
+
+  uint16_t version_needed = read_le16(header + 4);
+  uint16_t flags = read_le16(header + 6);
+  uint16_t method = read_le16(header + 8);
+  uint32_t compressed_size = read_le32(header + 18);
+  uint16_t name_len = read_le16(header + 26);
+  uint16_t extra_len = read_le16(header + 28);
+  if (version_needed < 10 || version_needed > 63)
+    return 0;
+  if (!zip_method_looks_plausible(method))
+    return 0;
+  if (name_len == 0 || name_len > 4096)
+    return 0;
+
+  uint64_t data_start = pos + sizeof(header);
+  if (data_start < pos || name_len > file_size - data_start)
+    return 0;
+  data_start += name_len;
+  if (extra_len > file_size - data_start)
+    return 0;
+  data_start += extra_len;
+  if ((flags & 0x0008u) == 0 && compressed_size > file_size - data_start)
+    return 0;
+  return 1;
 }
 
 static int parse_mp4_atoms(FILE *f, uint64_t file_size, uint64_t *video_end) {
@@ -119,7 +164,6 @@ static int find_zip_start_from_eocd(FILE *f, uint64_t file_size,
   const unsigned char sig_eocd[4] = {'P', 'K', 0x05, 0x06};
   const unsigned char sig_zip64[4] = {'P', 'K', 0x06, 0x06};
   const unsigned char sig_cd[4] = {'P', 'K', 0x01, 0x02};
-  const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
 
   size_t search_size = (file_size < 65536ULL) ? (size_t)file_size : 65536U;
   if (search_size < 22)
@@ -174,9 +218,7 @@ static int find_zip_start_from_eocd(FILE *f, uint64_t file_size,
     return 0;
   }
 
-  unsigned char sig[4];
-  if (seek_read(f, zip_start, sig, sizeof(sig)) == 0 &&
-      memcmp(sig, sig_local, 4) == 0) {
+  if (zip_local_header_valid(f, zip_start, file_size)) {
     *zip_start_out = zip_start;
     free(tail);
     return 1;
@@ -214,7 +256,7 @@ static int find_zip_start_scan(FILE *f, uint64_t file_size,
       for (size_t i = 0; i + 4 <= total; i++) {
         if (memcmp(buf + i, sig_local, 4) == 0) {
           uint64_t abs = (pos - (uint64_t)carry) + (uint64_t)i;
-          if (abs < file_size) {
+          if (abs < file_size && zip_local_header_valid(f, abs, file_size)) {
             *zip_start_out = abs;
             free(buf);
             return 1;
@@ -248,7 +290,8 @@ int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start) {
 
   const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
   unsigned char head[8] = {0};
-  if (seek_read(f, 0, head, 4) == 0 && memcmp(head, sig_local, 4) == 0) {
+  if (seek_read(f, 0, head, 4) == 0 && memcmp(head, sig_local, 4) == 0 &&
+      zip_local_header_valid(f, 0, file_size)) {
     *zip_start = 0;
     fclose(f);
     return 1;
@@ -258,9 +301,7 @@ int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start) {
     uint64_t video_end = 0;
     if (parse_mp4_atoms(f, file_size, &video_end) == 0 && video_end > 0 &&
         video_end < file_size) {
-      unsigned char sig[4];
-      if (seek_read(f, video_end, sig, sizeof(sig)) == 0 &&
-          memcmp(sig, sig_local, 4) == 0) {
+      if (zip_local_header_valid(f, video_end, file_size)) {
         *zip_start = video_end;
         fclose(f);
         return 1;
