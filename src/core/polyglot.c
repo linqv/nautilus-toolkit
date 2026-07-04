@@ -1,0 +1,439 @@
+#define _GNU_SOURCE
+#include "polyglot.h"
+#include "path.h"
+#include "strbuf.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static uint32_t read_be32(const unsigned char *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t read_be64(const unsigned char *p) {
+  return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+         ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+         ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+         ((uint64_t)p[6] << 8) | (uint64_t)p[7];
+}
+
+static uint32_t read_le32(const unsigned char *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
+static uint64_t read_le64(const unsigned char *p) {
+  return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+         ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) |
+         ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) |
+         ((uint64_t)p[7] << 56);
+}
+
+static int has_mp4_atom_type(const unsigned char *type4) {
+  static const char known[][4] = {
+      {'f', 't', 'y', 'p'}, {'m', 'o', 'o', 'v'}, {'m', 'd', 'a', 't'},
+      {'f', 'r', 'e', 'e'}, {'s', 'k', 'i', 'p'}, {'w', 'i', 'd', 'e'},
+      {'p', 'n', 'o', 't'}, {'m', 'o', 'o', 'f'}, {'s', 'i', 'd', 'x'},
+      {'s', 't', 'y', 'p'}, {'p', 'd', 'i', 'n'}, {'m', 'e', 't', 'a'},
+      {'u', 'u', 'i', 'd'}};
+  for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+    if (memcmp(type4, known[i], 4) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static int read_file_size(const char *filepath, uint64_t *size_out) {
+  if (!filepath || !size_out)
+    return -1;
+  struct stat st;
+  if (stat(filepath, &st) != 0)
+    return -1;
+  if (st.st_size < 0)
+    return -1;
+  *size_out = (uint64_t)st.st_size;
+  return 0;
+}
+
+static int seek_read(FILE *f, uint64_t pos, unsigned char *buf, size_t n) {
+  if (!f || !buf)
+    return -1;
+  if (fseeko(f, (off_t)pos, SEEK_SET) != 0)
+    return -1;
+  return fread(buf, 1, n, f) == n ? 0 : -1;
+}
+
+static int parse_mp4_atoms(FILE *f, uint64_t file_size, uint64_t *video_end) {
+  if (!f || !video_end)
+    return -1;
+  uint64_t pos = 0;
+  while (pos + 8 <= file_size) {
+    unsigned char header[16];
+    if (seek_read(f, pos, header, 8) != 0)
+      break;
+
+    uint64_t atom_size = (uint64_t)read_be32(header);
+    const unsigned char *atom_type = header + 4;
+    if (atom_size == 1) {
+      if (seek_read(f, pos + 8, header + 8, 8) != 0)
+        break;
+      atom_size = read_be64(header + 8);
+    } else if (atom_size == 0) {
+      break;
+    }
+
+    if (atom_size < 8 || atom_size > file_size - pos ||
+        !has_mp4_atom_type(atom_type)) {
+      break;
+    }
+    pos += atom_size;
+  }
+  *video_end = pos;
+  return 0;
+}
+
+static int find_last_sig(const unsigned char *buf, size_t len,
+                         const unsigned char sig[4], size_t *idx_out) {
+  if (!buf || len < 4 || !idx_out)
+    return 0;
+  for (size_t i = len - 4 + 1; i-- > 0;) {
+    if (buf[i] == sig[0] && buf[i + 1] == sig[1] && buf[i + 2] == sig[2] &&
+        buf[i + 3] == sig[3]) {
+      *idx_out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int find_zip_start_from_eocd(FILE *f, uint64_t file_size,
+                                    uint64_t *zip_start_out) {
+  if (!f || !zip_start_out)
+    return 0;
+  const unsigned char sig_eocd[4] = {'P', 'K', 0x05, 0x06};
+  const unsigned char sig_zip64[4] = {'P', 'K', 0x06, 0x06};
+  const unsigned char sig_cd[4] = {'P', 'K', 0x01, 0x02};
+  const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
+
+  size_t search_size = (file_size < 65536ULL) ? (size_t)file_size : 65536U;
+  if (search_size < 22)
+    return 0;
+
+  unsigned char *tail = (unsigned char *)malloc(search_size);
+  if (!tail)
+    return 0;
+  uint64_t tail_abs = file_size - (uint64_t)search_size;
+  if (seek_read(f, tail_abs, tail, search_size) != 0) {
+    free(tail);
+    return 0;
+  }
+
+  size_t eocd_idx = 0;
+  if (!find_last_sig(tail, search_size, sig_eocd, &eocd_idx)) {
+    free(tail);
+    return 0;
+  }
+
+  uint64_t cd_offset_recorded = 0;
+  size_t z64_idx = 0;
+  if (find_last_sig(tail, search_size, sig_zip64, &z64_idx) &&
+      search_size - z64_idx >= 56) {
+    cd_offset_recorded = read_le64(tail + z64_idx + 48);
+  } else {
+    if (search_size - eocd_idx < 22) {
+      free(tail);
+      return 0;
+    }
+    cd_offset_recorded = (uint64_t)read_le32(tail + eocd_idx + 16);
+    if (cd_offset_recorded == 0xFFFFFFFFULL) {
+      free(tail);
+      return 0;
+    }
+  }
+
+  size_t cd_idx = 0;
+  if (!find_last_sig(tail, search_size, sig_cd, &cd_idx)) {
+    free(tail);
+    return 0;
+  }
+  uint64_t cd_abs = tail_abs + (uint64_t)cd_idx;
+  if (cd_abs < cd_offset_recorded) {
+    free(tail);
+    return 0;
+  }
+
+  uint64_t zip_start = cd_abs - cd_offset_recorded;
+  if (zip_start >= file_size) {
+    free(tail);
+    return 0;
+  }
+
+  unsigned char sig[4];
+  if (seek_read(f, zip_start, sig, sizeof(sig)) == 0 &&
+      memcmp(sig, sig_local, 4) == 0) {
+    *zip_start_out = zip_start;
+    free(tail);
+    return 1;
+  }
+
+  free(tail);
+  return 0;
+}
+
+static int find_zip_start_scan(FILE *f, uint64_t file_size,
+                               uint64_t *zip_start_out) {
+  if (!f || !zip_start_out)
+    return 0;
+  const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
+  const size_t chunk_size = 8U * 1024U * 1024U;
+  unsigned char *buf = (unsigned char *)malloc(chunk_size + 3);
+  if (!buf)
+    return 0;
+
+  uint64_t pos = 0;
+  size_t carry = 0;
+  while (pos < file_size) {
+    size_t to_read = chunk_size;
+    if (file_size - pos < (uint64_t)to_read)
+      to_read = (size_t)(file_size - pos);
+
+    if (fseeko(f, (off_t)pos, SEEK_SET) != 0)
+      break;
+    size_t n = fread(buf + carry, 1, to_read, f);
+    if (n == 0)
+      break;
+
+    size_t total = carry + n;
+    if (total >= 4) {
+      for (size_t i = 0; i + 4 <= total; i++) {
+        if (memcmp(buf + i, sig_local, 4) == 0) {
+          uint64_t abs = (pos - (uint64_t)carry) + (uint64_t)i;
+          if (abs < file_size) {
+            *zip_start_out = abs;
+            free(buf);
+            return 1;
+          }
+        }
+      }
+    }
+
+    carry = (total >= 3) ? 3 : total;
+    if (carry > 0)
+      memmove(buf, buf + (total - carry), carry);
+    pos += (uint64_t)n;
+  }
+
+  free(buf);
+  return 0;
+}
+
+int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start) {
+  if (!filepath || !zip_start)
+    return -1;
+  *zip_start = 0;
+
+  uint64_t file_size = 0;
+  if (read_file_size(filepath, &file_size) != 0 || file_size < 4)
+    return 0;
+
+  FILE *f = fopen(filepath, "rb");
+  if (!f)
+    return -1;
+
+  const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
+  unsigned char head[8] = {0};
+  if (seek_read(f, 0, head, 4) == 0 && memcmp(head, sig_local, 4) == 0) {
+    *zip_start = 0;
+    fclose(f);
+    return 1;
+  }
+
+  if (seek_read(f, 0, head, 8) == 0 && memcmp(head + 4, "ftyp", 4) == 0) {
+    uint64_t video_end = 0;
+    if (parse_mp4_atoms(f, file_size, &video_end) == 0 && video_end > 0 &&
+        video_end < file_size) {
+      unsigned char sig[4];
+      if (seek_read(f, video_end, sig, sizeof(sig)) == 0 &&
+          memcmp(sig, sig_local, 4) == 0) {
+        *zip_start = video_end;
+        fclose(f);
+        return 1;
+      }
+    }
+  }
+
+  if (find_zip_start_from_eocd(f, file_size, zip_start)) {
+    fclose(f);
+    return 1;
+  }
+
+  if (find_zip_start_scan(f, file_size, zip_start)) {
+    fclose(f);
+    return 1;
+  }
+
+  fclose(f);
+  return 0;
+}
+
+int polyglot_copy_tail(const char *src_path, uint64_t zip_start,
+                       const char *dst_path) {
+  if (!src_path || !dst_path)
+    return -1;
+
+  uint64_t file_size = 0;
+  if (read_file_size(src_path, &file_size) != 0)
+    return -1;
+  if (zip_start >= file_size)
+    return -1;
+
+  FILE *fin = fopen(src_path, "rb");
+  if (!fin)
+    return -1;
+  FILE *fout = fopen(dst_path, "wb");
+  if (!fout) {
+    fclose(fin);
+    return -1;
+  }
+
+  if (fseeko(fin, (off_t)zip_start, SEEK_SET) != 0) {
+    fclose(fin);
+    fclose(fout);
+    return -1;
+  }
+
+  uint64_t remaining = file_size - zip_start;
+  const size_t buf_size = 8U * 1024U * 1024U;
+  unsigned char *buf = (unsigned char *)malloc(buf_size);
+  if (!buf) {
+    fclose(fin);
+    fclose(fout);
+    return -1;
+  }
+
+  int ok = 1;
+  while (remaining > 0) {
+    size_t nread = buf_size;
+    if (remaining < (uint64_t)nread)
+      nread = (size_t)remaining;
+    size_t got = fread(buf, 1, nread, fin);
+    if (got == 0) {
+      ok = 0;
+      break;
+    }
+    size_t off = 0;
+    while (off < got) {
+      size_t wr = fwrite(buf + off, 1, got - off, fout);
+      if (wr == 0) {
+        ok = 0;
+        break;
+      }
+      off += wr;
+    }
+    if (!ok)
+      break;
+    remaining -= (uint64_t)got;
+  }
+
+  free(buf);
+  if (fclose(fin) != 0)
+    ok = 0;
+  if (fclose(fout) != 0)
+    ok = 0;
+  return ok ? 0 : -1;
+}
+
+static char *make_temp_path(const char *src_path) {
+  if (!src_path)
+    return NULL;
+  char *parent = path_parent(src_path);
+  if (!parent)
+    return NULL;
+
+  StrBuf sb;
+  sb_init(&sb);
+  static const char suffix[] = ".nautilus-toolkit-polyglot-XXXXXX";
+  int ok = sb_append(&sb, parent, strlen(parent)) && sb_append_c(&sb, '/') &&
+           sb_append(&sb, suffix, strlen(suffix));
+  free(parent);
+  if (!ok || !sb.data) {
+    sb_free(&sb);
+    return NULL;
+  }
+
+  int fd = mkstemp(sb.data);
+  if (fd < 0) {
+    sb_free(&sb);
+    return NULL;
+  }
+  close(fd);
+  return sb.data;
+}
+
+int polyglot_make_temp_fixed_zip(const char *src_path, char **out_temp_path,
+                                 uint64_t *out_zip_start) {
+  if (!src_path || !out_temp_path)
+    return -1;
+  *out_temp_path = NULL;
+  if (out_zip_start)
+    *out_zip_start = 0;
+
+  uint64_t zip_start = 0;
+  int find_rc = polyglot_find_zip_start(src_path, &zip_start);
+  if (find_rc <= 0)
+    return find_rc;
+  if (zip_start == 0)
+    return 0;
+
+  char *tmp_path = make_temp_path(src_path);
+  if (!tmp_path)
+    return -1;
+  if (polyglot_copy_tail(src_path, zip_start, tmp_path) != 0) {
+    unlink(tmp_path);
+    free(tmp_path);
+    return -1;
+  }
+
+  *out_temp_path = tmp_path;
+  if (out_zip_start)
+    *out_zip_start = zip_start;
+  return 1;
+}
+
+void polyglot_cleanup_temp(char **temp_path) {
+  if (!temp_path || !*temp_path)
+    return;
+  unlink(*temp_path);
+  free(*temp_path);
+  *temp_path = NULL;
+}
+
+int polyglot_should_try_after_7z_error(const char *error_output) {
+  if (!error_output || !*error_output)
+    return 1;
+
+  static const char *non_retryable[] = {
+      "No space left on device",
+      "not enough space",
+      "Permission denied",
+      "Access is denied",
+      "No such file or directory",
+      "Headers Error",
+      "Unexpected end of data",
+      "Unexpected end of archive",
+  };
+
+  for (size_t i = 0; i < sizeof(non_retryable) / sizeof(non_retryable[0]);
+       i++) {
+    if (strstr(error_output, non_retryable[i]))
+      return 0;
+  }
+
+  return 1;
+}
