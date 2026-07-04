@@ -1291,6 +1291,18 @@ static void report_try_progress(TryPasswordProgressFn cb, void *ud,
   cb(attempted, total, ud);
 }
 
+static int should_use_bsdtar_gbk_password_probe(const char *filepath) {
+  StrBuf listing;
+  sb_init(&listing);
+  int probe_rc =
+      run_7z_probe_password_fast(filepath, NULL, NULL, 0, &listing, 0);
+  int use_bsdtar =
+      probe_rc == 1 &&
+      archive_needs_legacy_gbk_password_before_extract(filepath, listing.data);
+  sb_free(&listing);
+  return use_bsdtar;
+}
+
 static void drain_try_progress_fd(int fd, int *attempted, int total,
                                   TryPasswordProgressFn cb, void *ud) {
   if (fd < 0 || !attempted || total <= 0)
@@ -1337,6 +1349,7 @@ int try_password_list(const char *filepath, PwdVec *v, char **hit, int jobs,
   }
   int total_candidates = (int)cands.len;
   int attempted_candidates = 0;
+  int use_bsdtar_gbk_probe = should_use_bsdtar_gbk_password_probe(filepath);
   report_try_progress(progress_cb, progress_ud, 0, total_candidates);
 
   if (jobs <= 1) {
@@ -1345,9 +1358,13 @@ int try_password_list(const char *filepath, PwdVec *v, char **hit, int jobs,
         candvec_free(&cands);
         return -1;
       }
-      int r = run_7z_probe_password_fast(filepath, cands.data[i].bytes,
-                                         cands.data[i].locale, 1,
-                                         listing_out, 1);
+      int r = use_bsdtar_gbk_probe
+                  ? run_bsdtar_probe_password_for_file(filepath,
+                                                       cands.data[i].bytes,
+                                                       NULL)
+                  : run_7z_probe_password_fast(filepath, cands.data[i].bytes,
+                                               cands.data[i].locale, 1,
+                                               listing_out, 1);
       attempted_candidates++;
       report_try_progress(progress_cb, progress_ud, attempted_candidates,
                           total_candidates);
@@ -1430,9 +1447,28 @@ int try_password_list(const char *filepath, PwdVec *v, char **hit, int jobs,
         /* Test the batch */
         int hit_idx = -1;
         int attempted_in_batch = 0;
-        int r = run_7z_probe_password_batch(filepath, batch_pwd, batch_locale,
-                                           batch_count, &hit_idx,
-                                           &attempted_in_batch);
+        int r = -2;
+        if (use_bsdtar_gbk_probe) {
+          for (int bi = 0; bi < batch_count; bi++) {
+            attempted_in_batch++;
+            int pr =
+                run_bsdtar_probe_password_for_file(filepath, batch_pwd[bi],
+                                                   NULL);
+            if (pr == 1) {
+              hit_idx = bi;
+              r = bi;
+              break;
+            }
+            if (pr < 0) {
+              r = -1;
+              break;
+            }
+          }
+        } else {
+          r = run_7z_probe_password_batch(filepath, batch_pwd, batch_locale,
+                                          batch_count, &hit_idx,
+                                          &attempted_in_batch);
+        }
         if (progress_pipe[1] >= 0 && attempted_in_batch > 0) {
           unsigned char d = (unsigned char)(attempted_in_batch > 255
                                                 ? 255

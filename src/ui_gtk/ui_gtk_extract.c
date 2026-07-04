@@ -433,7 +433,10 @@ gpointer ui_gtk_worker_func(gpointer data) {
     int outdir_with_password = 0;
     int outdir_needs_password_recheck = 0;
     int legacy_gbk_zip = archive_has_legacy_gbk_zip_names(archive_path);
-    int legacy_gbk_zip_unencrypted = 0;
+    int legacy_gbk_zip_needs_fallback = 0;
+    int legacy_gbk_zip_can_extract_without_password = 0;
+    int legacy_gbk_zip_waits_for_password = 0;
+    int archive_waits_for_password = 0;
     int success = 0;
     char *failure_reason = NULL;
     int need_save_pwd = 0;
@@ -441,8 +444,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
     char *extract_locale_used = NULL;
 
     /* Pre-probe: run a no-password 7z l -ba to capture the listing.
-       If the archive is not encrypted, we can determine the output dir
-       directly from this listing without a separate 7z call later. */
+       ZIPs with clear headers may list successfully even when file contents
+       are encrypted, so encryption is checked separately below. */
     StrBuf pre_listing;
     sb_init(&pre_listing);
     int pre_probe_rc = -1;
@@ -450,7 +453,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
       pre_probe_rc = run_7z_probe_password_fast(archive_path, NULL, NULL, 0,
                                                  &pre_listing, 0);
       if (pre_probe_rc == 1 && pre_listing.data && pre_listing.len > 0) {
-        /* Archive is not encrypted – use listing directly. */
+        /* Listing is available without a password; file contents may still
+           be encrypted, so only use it for output-directory selection. */
         outdir = determine_output_dir_with_listing(
             filepath, pre_listing.data, 0, NULL);
         outdir_with_password = 0;
@@ -466,8 +470,19 @@ gpointer ui_gtk_worker_func(gpointer data) {
     }
     if (pre_probe_rc == 1 &&
         archive_needs_legacy_gbk_zip_fallback(archive_path, pre_listing.data)) {
-      legacy_gbk_zip_unencrypted = 1;
-      log_msg("Legacy GBK ZIP filename fallback enabled: %s", filepath);
+      legacy_gbk_zip_needs_fallback = 1;
+      int encrypted_rc = archive_has_encrypted_content(archive_path);
+      if (encrypted_rc == 1) {
+        legacy_gbk_zip_waits_for_password = 1;
+        log_msg("Legacy GBK ZIP filename fallback needs passphrase: %s",
+                filepath);
+      } else if (encrypted_rc == 0) {
+        legacy_gbk_zip_can_extract_without_password = 1;
+        log_msg("Legacy GBK ZIP filename fallback enabled: %s", filepath);
+      } else {
+        log_msg("Legacy GBK ZIP encryption probe failed, deferring fallback: %s",
+                filepath);
+      }
     }
     sb_free(&pre_listing);
 
@@ -494,6 +509,15 @@ gpointer ui_gtk_worker_func(gpointer data) {
       if (password_to_use) {
         use_password = 1;
         tried_manual = 1;
+      }
+    }
+
+    if (!use_password) {
+      if (pre_probe_rc == 0 || legacy_gbk_zip_waits_for_password) {
+        archive_waits_for_password = 1;
+      } else if (archive_needs_password_before_extract(archive_path)) {
+        archive_waits_for_password = 1;
+        log_msg("Archive encrypted content needs passphrase: %s", filepath);
       }
     }
 
@@ -573,9 +597,16 @@ gpointer ui_gtk_worker_func(gpointer data) {
         for (size_t k = 0; k < vars.len; k++) {
           if (!vars.data[k].bytes || g_atomic_int_get(&ctx->cancelled))
             continue;
-          int pr = run_7z_probe_password_fast(
-              archive_path, vars.data[k].bytes, vars.data[k].locale, 1,
-              &probe_listing, 0);
+          int pr = -1;
+          if (legacy_gbk_zip_needs_fallback &&
+              strcmp(archive_path, filepath) == 0) {
+            pr = run_bsdtar_probe_password_for_file(
+                archive_path, vars.data[k].bytes, NULL);
+          } else {
+            pr = run_7z_probe_password_fast(
+                archive_path, vars.data[k].bytes, vars.data[k].locale, 1,
+                &probe_listing, 0);
+          }
           if (pr == 1) {
             probe_hit = (int)k;
             break;
@@ -619,11 +650,12 @@ gpointer ui_gtk_worker_func(gpointer data) {
             }
             pipe_writef(write_fd, "# RESET_PROGRESS\n");
             progress_floor = (int)start_pct;
-            if (legacy_gbk_zip_unencrypted &&
+            if (legacy_gbk_zip_needs_fallback &&
                 strcmp(archive_path, filepath) == 0) {
               last_ec = run_extract_gbk_zip_for_file(
-                  archive_path, outdir, pipe_stream, start_pct, slot_size,
-                  &out, filename, i + 1, total, &progress_floor);
+                  archive_path, outdir, vars.data[probe_hit].bytes,
+                  pipe_stream, start_pct, slot_size, &out, filename, i + 1,
+                  total, &progress_floor);
             } else {
               last_ec = run_extract_for_file(
                   archive_path, outdir, vars.data[probe_hit].bytes,
@@ -647,17 +679,21 @@ gpointer ui_gtk_worker_func(gpointer data) {
 
         varvec_free(&vars);
       } else {
-        if (!prepare_extract_outdir(&outdir, parent, custom_dest,
-                                    &outdir_created_by_us,
-                                    &outdir_existed_before)) {
+        if (archive_waits_for_password) {
+          sb_append(&out, "需要密码", strlen("需要密码"));
+          last_ec = 255;
+        } else if (!prepare_extract_outdir(&outdir, parent, custom_dest,
+                                           &outdir_created_by_us,
+                                           &outdir_existed_before)) {
           sb_append(&out, "无法创建输出目录", strlen("无法创建输出目录"));
           non_pwd_error = 1;
         } else {
           pipe_writef(write_fd, "# RESET_PROGRESS\n");
-          if (legacy_gbk_zip_unencrypted &&
+          if (legacy_gbk_zip_needs_fallback &&
+              legacy_gbk_zip_can_extract_without_password &&
               strcmp(archive_path, filepath) == 0) {
             last_ec = run_extract_gbk_zip_for_file(
-                archive_path, outdir, pipe_stream, start_pct, slot_size,
+                archive_path, outdir, NULL, pipe_stream, start_pct, slot_size,
                 &out, filename, i + 1, total, &progress_floor);
           } else {
             last_ec = run_extract_for_file(archive_path, outdir, "", NULL,

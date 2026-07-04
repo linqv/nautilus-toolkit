@@ -323,6 +323,17 @@ int archive_needs_legacy_gbk_zip_fallback(const char *filepath,
   return archive_has_legacy_gbk_zip_names(filepath) && !is_valid_utf8(listing);
 }
 
+int archive_needs_legacy_gbk_password_before_extract(const char *filepath,
+                                                     const char *listing) {
+  if (!archive_needs_legacy_gbk_zip_fallback(filepath, listing))
+    return 0;
+  return archive_needs_password_before_extract(filepath);
+}
+
+int archive_needs_password_before_extract(const char *filepath) {
+  return archive_has_encrypted_content(filepath) == 1;
+}
+
 static pid_t spawn_capture_child(char **argv, int *out_fd) {
   int pipefd[2];
   if (!argv || !argv[0] || !out_fd || pipe(pipefd) != 0)
@@ -1366,6 +1377,7 @@ int run_extract_for_file(const char *filepath, const char *outdir,
 }
 
 int run_extract_gbk_zip_for_file(const char *filepath, const char *outdir,
+                                 const char *pwd_bytes,
                                  FILE *progress_pipe, double start_pct,
                                  double slot_size, StrBuf *out,
                                  const char *archive_label, int task_index,
@@ -1386,8 +1398,20 @@ int run_extract_gbk_zip_for_file(const char *filepath, const char *outdir,
     fflush(progress_pipe);
   }
 
-  char *args[] = {"bsdtar", "--options", "hdrcharset=GBK", "-xf",
-                  (char *)filepath, "-C", (char *)outdir, NULL};
+  char *args[10];
+  int argn = 0;
+  args[argn++] = "bsdtar";
+  args[argn++] = "--options";
+  args[argn++] = "hdrcharset=GBK";
+  if (pwd_bytes && *pwd_bytes) {
+    args[argn++] = "--passphrase";
+    args[argn++] = (char *)pwd_bytes;
+  }
+  args[argn++] = "-xf";
+  args[argn++] = (char *)filepath;
+  args[argn++] = "-C";
+  args[argn++] = (char *)outdir;
+  args[argn++] = NULL;
   int ec = run_child_capture(args, out);
   if (ec == 0 && progress_pipe) {
     int done_pct = (int)(start_pct + slot_size);
@@ -1403,6 +1427,177 @@ int run_extract_gbk_zip_for_file(const char *filepath, const char *outdir,
       *global_progress_floor = done_pct;
   }
   return ec;
+}
+
+static int first_file_from_bsdtar_listing(const char *listing, StrBuf *entry) {
+  if (!listing || !entry)
+    return 0;
+  entry->len = 0;
+  if (entry->data)
+    entry->data[0] = 0;
+
+  char *copy = str_dup(listing);
+  if (!copy)
+    return 0;
+  int found = 0;
+  char *saveptr = NULL;
+  for (char *line = strtok_r(copy, "\n", &saveptr); line;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ' ||
+                       line[len - 1] == '\t')) {
+      line[--len] = 0;
+    }
+    while (*line == ' ' || *line == '\t')
+      line++;
+    if (!*line || (len > 0 && line[len - 1] == '/'))
+      continue;
+    found = sb_append(entry, line, strlen(line));
+    break;
+  }
+  free(copy);
+  return found;
+}
+
+int run_bsdtar_probe_password_for_file(const char *filepath,
+                                       const char *pwd_bytes, StrBuf *out) {
+  if (out) {
+    out->len = 0;
+    if (out->data)
+      out->data[0] = 0;
+  }
+  if (!filepath || !*filepath || !pwd_bytes || !*pwd_bytes)
+    return -1;
+  if (cancel_requested())
+    return -1;
+
+  StrBuf listing;
+  sb_init(&listing);
+  char *list_args[] = {"bsdtar", "--options", "hdrcharset=GBK", "-tf",
+                       (char *)filepath, NULL};
+  int list_ec = run_child_capture(list_args, &listing);
+  if (list_ec != 0) {
+    if (out && listing.data)
+      sb_append(out, listing.data, listing.len);
+    sb_free(&listing);
+    return -1;
+  }
+
+  StrBuf entry;
+  sb_init(&entry);
+  int have_entry = first_file_from_bsdtar_listing(listing.data, &entry);
+  sb_free(&listing);
+  if (!have_entry || !entry.data || !*entry.data) {
+    sb_free(&entry);
+    return -1;
+  }
+
+  char *args[] = {"bsdtar", "--passphrase", (char *)pwd_bytes, "--options",
+                  "hdrcharset=GBK", "-xOf", (char *)filepath, entry.data,
+                  NULL};
+  int read_fd = -1;
+  pid_t pid = spawn_capture_child(args, &read_fd);
+  sb_free(&entry);
+  if (pid < 0)
+    return -1;
+  set_active_7z_pid(pid);
+
+  int flags = fcntl(read_fd, F_GETFL, 0);
+  if (flags >= 0)
+    (void)fcntl(read_fd, F_SETFL, flags | O_NONBLOCK);
+
+  int finished = 0;
+  int status = 0;
+  int have_status = 0;
+  int early_ok = 0;
+  size_t total_read = 0;
+  static const size_t PROBE_OK_THRESHOLD = 65536;
+  char tail[4096];
+  size_t tail_used = 0;
+  tail[0] = 0;
+
+  while (!finished) {
+    if (cancel_requested())
+      terminate_pid(pid);
+
+    struct pollfd pfd = {.fd = read_fd, .events = POLLIN | POLLHUP};
+    int pr = poll(&pfd, 1, 200);
+    if (pr < 0) {
+      if (errno == EINTR)
+        continue;
+      finished = 1;
+      break;
+    }
+    if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+      while (1) {
+        char tmp[4096];
+        ssize_t n = read(read_fd, tmp, sizeof(tmp));
+        if (n > 0) {
+          size_t chunk = (size_t)n;
+          rolling_append(tail, sizeof(tail), &tail_used, tmp, chunk);
+          if (out)
+            sb_append(out, tmp, chunk);
+          total_read += chunk;
+          if (total_read >= PROBE_OK_THRESHOLD) {
+            early_ok = 1;
+            terminate_pid(pid);
+            finished = 1;
+            break;
+          }
+          continue;
+        }
+        if (n == 0) {
+          finished = 1;
+          break;
+        }
+        if (errno == EINTR)
+          continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          break;
+        finished = 1;
+        break;
+      }
+    }
+
+    if (!finished) {
+      pid_t r = waitpid(pid, &status, WNOHANG);
+      if (r == pid) {
+        have_status = 1;
+        finished = 1;
+      }
+    }
+  }
+
+  while (1) {
+    char tmp[4096];
+    ssize_t n = read(read_fd, tmp, sizeof(tmp));
+    if (n > 0) {
+      if (!early_ok) {
+        rolling_append(tail, sizeof(tail), &tail_used, tmp, (size_t)n);
+        if (out)
+          sb_append(out, tmp, (size_t)n);
+      }
+      continue;
+    }
+    if (n < 0 && errno == EINTR)
+      continue;
+    break;
+  }
+  close(read_fd);
+
+  if (!have_status)
+    reap_7z_pid(pid, &status);
+  clear_active_7z_pid(pid);
+
+  if (cancel_requested())
+    return -1;
+  if (early_ok)
+    return 1;
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    return 1;
+  if (need_password_from_output(tail))
+    return 0;
+  return -1;
 }
 
 int run_7z_probe_password_test(const char *filepath, const char *test_file,
@@ -1432,7 +1627,7 @@ int run_7z_probe_password_test(const char *filepath, const char *test_file,
     args[argn++] = "-p";
   args[argn++] = "-bb0";
   args[argn++] = "-bd";
-  args[argn++] = require_full_read ? "-bso0" : "-bso1";
+  args[argn++] = "-bso1";
   args[argn++] = "-bse2";
   args[argn++] = "-bsp0";
   args[argn++] = "-mmt=off";
@@ -1536,8 +1731,13 @@ int run_7z_probe_password_test(const char *filepath, const char *test_file,
 
   if (cancel_requested())
     return -1;
+  if (strstr(tail, "No files to process"))
+    return -1;
   if (early_ok)
     return 1;
+  if (!require_full_read && total_read == 0 &&
+      WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    return -1;
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
     return 1;
   if (need_password_from_output(tail))
@@ -1737,6 +1937,8 @@ int need_password_from_output(const char *out) {
     return 0;
   const char *keys[] = {"Wrong password",    "Enter password",
                         "encrypted archive", "Can not open encrypted archive",
+                        "Incorrect passphrase",
+                        "Too many incorrect passphrases",
                         "CRC Failed",        "密码错误",
                         "需要密码",          "请输入密码",
                         "输入密码",          "加密文件",

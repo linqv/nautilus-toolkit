@@ -18,13 +18,20 @@ int run_extract_for_file(const char *filepath, const char *outdir,
 int archive_has_legacy_gbk_zip_names(const char *filepath);
 int archive_needs_legacy_gbk_zip_fallback(const char *filepath,
                                           const char *listing);
+int archive_needs_legacy_gbk_password_before_extract(const char *filepath,
+                                                     const char *listing);
+int archive_needs_password_before_extract(const char *filepath);
 
 int run_extract_gbk_zip_for_file(const char *filepath, const char *outdir,
+                                 const char *pwd_bytes,
                                  FILE *progress_pipe, double start_pct,
                                  double slot_size, StrBuf *out,
                                  const char *archive_label, int task_index,
                                  int task_total,
                                  int *global_progress_floor);
+
+int run_bsdtar_probe_password_for_file(const char *filepath,
+                                       const char *pwd_bytes, StrBuf *out);
 
 /* blocking=1: use blocking read (faster for cracking workers in subprocesses).
    blocking=0: use poll-based non-blocking read (allows cancel checks in GTK worker thread). */
