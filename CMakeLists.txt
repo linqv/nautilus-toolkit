@@ -56,6 +56,7 @@ pkg_check_modules(NAUTILUS REQUIRED libnautilus-extension-4>=43.0)
 pkg_check_modules(GTK4     REQUIRED gtk4>=4.10)
 pkg_check_modules(LIBADW   REQUIRED libadwaita-1>=1.4)
 pkg_check_modules(JSON     REQUIRED json-glib-1.0>=1.6)
+pkg_check_modules(LIBARCHIVE REQUIRED libarchive>=3.6)
 
 # ── Nautilus extension install directory ──
 
@@ -100,6 +101,7 @@ add_library(nautilus-toolkit MODULE
     src/core/strbuf.c
     src/core/fsutil.c
     src/core/polyglot.c
+    src/core/polyglot_zip_extract.c
 )
 
 target_include_directories(nautilus-toolkit PRIVATE
@@ -116,6 +118,7 @@ target_include_directories(nautilus-toolkit SYSTEM PRIVATE
     ${GTK4_INCLUDE_DIRS}
     ${LIBADW_INCLUDE_DIRS}
     ${JSON_INCLUDE_DIRS}
+    ${LIBARCHIVE_INCLUDE_DIRS}
 )
 
 target_compile_options(nautilus-toolkit PRIVATE
@@ -126,6 +129,7 @@ target_compile_options(nautilus-toolkit PRIVATE
     ${GTK4_CFLAGS_OTHER}
     ${LIBADW_CFLAGS_OTHER}
     ${JSON_CFLAGS_OTHER}
+    ${LIBARCHIVE_CFLAGS_OTHER}
     -Wno-unused-parameter
 )
 
@@ -138,6 +142,7 @@ target_link_libraries(nautilus-toolkit PRIVATE
     ${GTK4_LIBRARIES}
     ${LIBADW_LIBRARIES}
     ${JSON_LIBRARIES}
+    ${LIBARCHIVE_LIBRARIES}
 )
 
 # iconv may be required on some platforms
