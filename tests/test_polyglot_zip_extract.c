@@ -37,6 +37,13 @@ static void expect_file_text(const char *path, const char *expected) {
   }
 }
 
+static void expect_path_missing(const char *name, const char *path) {
+  if (access(path, F_OK) != 0 && errno == ENOENT)
+    return;
+  fprintf(stderr, "%s: expected missing path %s\n", name, path);
+  failures++;
+}
+
 static uint32_t crc32_bytes(const unsigned char *data, size_t len) {
   uint32_t crc = 0xFFFFFFFFU;
   for (size_t i = 0; i < len; i++) {
@@ -125,6 +132,81 @@ static long write_zip_payload(FILE *f, const char *name, const char *text,
   return zip_start;
 }
 
+typedef struct {
+  const char *name;
+  const char *text;
+  uint16_t method;
+} TestZipEntry;
+
+static long write_zip_payload_entries(FILE *f, const TestZipEntry *entries,
+                                      size_t entry_count) {
+  long zip_start = ftell(f);
+  long local_offsets[8];
+  uint32_t crcs[8];
+  size_t data_lens[8];
+
+  if (entry_count > 8)
+    return -1;
+
+  for (size_t i = 0; i < entry_count; i++) {
+    size_t name_len = strlen(entries[i].name);
+    data_lens[i] = strlen(entries[i].text);
+    crcs[i] = entries[i].method == 0
+                  ? crc32_bytes((const unsigned char *)entries[i].text,
+                                data_lens[i])
+                  : 0;
+    local_offsets[i] = ftell(f) - zip_start;
+
+    put_le32(f, 0x04034b50U);
+    put_le16(f, 20);
+    put_le16(f, 0);
+    put_le16(f, entries[i].method);
+    put_le16(f, 0);
+    put_le16(f, 0);
+    put_le32(f, crcs[i]);
+    put_le32(f, (uint32_t)data_lens[i]);
+    put_le32(f, (uint32_t)data_lens[i]);
+    put_le16(f, (uint16_t)name_len);
+    put_le16(f, 0);
+    fwrite(entries[i].name, 1, name_len, f);
+    fwrite(entries[i].text, 1, data_lens[i], f);
+  }
+
+  long cd_offset = ftell(f) - zip_start;
+  for (size_t i = 0; i < entry_count; i++) {
+    size_t name_len = strlen(entries[i].name);
+    put_le32(f, 0x02014b50U);
+    put_le16(f, 20);
+    put_le16(f, 20);
+    put_le16(f, 0);
+    put_le16(f, entries[i].method);
+    put_le16(f, 0);
+    put_le16(f, 0);
+    put_le32(f, crcs[i]);
+    put_le32(f, (uint32_t)data_lens[i]);
+    put_le32(f, (uint32_t)data_lens[i]);
+    put_le16(f, (uint16_t)name_len);
+    put_le16(f, 0);
+    put_le16(f, 0);
+    put_le16(f, 0);
+    put_le16(f, 0);
+    put_le32(f, 0);
+    put_le32(f, (uint32_t)local_offsets[i]);
+    fwrite(entries[i].name, 1, name_len, f);
+  }
+
+  long cd_size = (ftell(f) - zip_start) - cd_offset;
+  put_le32(f, 0x06054b50U);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, (uint16_t)entry_count);
+  put_le16(f, (uint16_t)entry_count);
+  put_le32(f, (uint32_t)cd_size);
+  put_le32(f, (uint32_t)cd_offset);
+  put_le16(f, 0);
+  return zip_start;
+}
+
 static char *make_temp_dir(const char *tag) {
   char tmpl[256];
   snprintf(tmpl, sizeof(tmpl), "/tmp/ntk-polyglot-zip-%s-XXXXXX", tag);
@@ -149,6 +231,33 @@ static char *make_polyglot_file(const char *tag, const char *entry,
   write_mp4_prefix(f);
   long zip_start = write_zip_payload(f, entry, text, method);
   fclose(f);
+  if (zip_start_out)
+    *zip_start_out = (uint64_t)zip_start;
+  return strdup(tmpl);
+}
+
+static char *make_polyglot_file_entries(const char *tag,
+                                        const TestZipEntry *entries,
+                                        size_t entry_count,
+                                        uint64_t *zip_start_out) {
+  char tmpl[256];
+  snprintf(tmpl, sizeof(tmpl), "/tmp/ntk-polyglot-zip-%s-XXXXXX.mp4", tag);
+  int fd = mkstemps(tmpl, 4);
+  if (fd < 0)
+    return NULL;
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    return NULL;
+  }
+  write_mp4_prefix(f);
+  long zip_start = write_zip_payload_entries(f, entries, entry_count);
+  fclose(f);
+  if (zip_start < 0) {
+    unlink(tmpl);
+    return NULL;
+  }
   if (zip_start_out)
     *zip_start_out = (uint64_t)zip_start;
   return strdup(tmpl);
@@ -208,8 +317,49 @@ static void test_extracts_nested_file(void) {
   free(outdir);
 }
 
+static void test_failed_extraction_removes_prior_outputs(void) {
+  TestZipEntry entries[] = {
+      {"safe.txt", "safe\n", 0},
+      {"../evil.txt", "evil\n", 0},
+  };
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file_entries("rollback", entries, 2, &zip_start);
+  char *parent = make_temp_dir("rollback-parent");
+
+  char outdir[512];
+  snprintf(outdir, sizeof(outdir), "%s/out", parent);
+  expect_int("create rollback outdir", mkdir(outdir, 0700), 0);
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, NULL, 0.0, 100.0,
+                                      &out, "rollback.mp4", 1, 1, NULL);
+  if (rc == 0) {
+    fprintf(stderr, "rollback extraction: expected nonzero, got 0\n");
+    failures++;
+  }
+
+  char safe_path[1024];
+  snprintf(safe_path, sizeof(safe_path), "%s/safe.txt", outdir);
+  expect_path_missing("rollback safe file", safe_path);
+
+  char evil_path[512];
+  snprintf(evil_path, sizeof(evil_path), "%s/evil.txt", parent);
+  expect_path_missing("rollback outside file", evil_path);
+
+  unlink(safe_path);
+  unlink(evil_path);
+  rmdir(outdir);
+  rmdir(parent);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(parent);
+}
+
 int main(void) {
   test_extracts_plain_zip_without_copy();
   test_extracts_nested_file();
+  test_failed_extraction_removes_prior_outputs();
   return failures == 0 ? 0 : 1;
 }

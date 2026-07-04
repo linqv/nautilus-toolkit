@@ -31,6 +31,17 @@ typedef struct {
   size_t buf_size;
 } ZipReader;
 
+typedef struct {
+  char *path;
+  int is_dir;
+} CreatedPath;
+
+typedef struct {
+  CreatedPath *items;
+  size_t len;
+  size_t cap;
+} CreatedList;
+
 static void append_errorf(StrBuf *out, const char *fmt, ...) {
   if (!out || !fmt)
     return;
@@ -48,6 +59,57 @@ static void append_errorf(StrBuf *out, const char *fmt, ...) {
   (void)sb_append(out, tmp, len);
   if (len == 0 || tmp[len - 1] != '\n')
     (void)sb_append_c(out, '\n');
+}
+
+static void created_list_free(CreatedList *created) {
+  if (!created)
+    return;
+  for (size_t i = 0; i < created->len; i++)
+    free(created->items[i].path);
+  free(created->items);
+  created->items = NULL;
+  created->len = 0;
+  created->cap = 0;
+}
+
+static int created_list_add(CreatedList *created, const char *path, int is_dir,
+                            StrBuf *out) {
+  if (!created)
+    return 1;
+  if (created->len == created->cap) {
+    size_t newcap = created->cap ? created->cap * 2 : 16;
+    if (newcap < created->cap) {
+      append_errorf(out, "Too many ZIP outputs to track for rollback");
+      return 0;
+    }
+    CreatedPath *tmp =
+        (CreatedPath *)realloc(created->items, newcap * sizeof(*tmp));
+    if (!tmp) {
+      append_errorf(out, "Out of memory while tracking ZIP outputs");
+      return 0;
+    }
+    created->items = tmp;
+    created->cap = newcap;
+  }
+
+  char *copy = strdup(path);
+  if (!copy) {
+    append_errorf(out, "Out of memory while tracking ZIP output path");
+    return 0;
+  }
+  created->items[created->len].path = copy;
+  created->items[created->len].is_dir = is_dir;
+  created->len++;
+  return 1;
+}
+
+static void rollback_created_outputs(int root_fd, CreatedList *created) {
+  if (!created)
+    return;
+  for (size_t i = created->len; i > 0; i--) {
+    CreatedPath *item = &created->items[i - 1];
+    (void)unlinkat(root_fd, item->path, item->is_dir ? AT_REMOVEDIR : 0);
+  }
 }
 
 static la_ssize_t zip_read_cb(struct archive *archive, void *client_data,
@@ -183,8 +245,42 @@ static int open_output_root(const char *outdir, StrBuf *out) {
   return fd;
 }
 
+static int append_component_path(char **path, size_t *len, size_t *cap,
+                                 const char *part, StrBuf *out) {
+  size_t part_len = strlen(part);
+  size_t extra = part_len + (*len > 0 ? 1U : 0U);
+  if (extra > (size_t)-1 - *len - 1) {
+    append_errorf(out, "ZIP output path is too long");
+    return 0;
+  }
+  size_t need = *len + extra + 1;
+  if (need > *cap) {
+    size_t newcap = *cap ? *cap * 2 : 64;
+    while (newcap < need) {
+      if (newcap > (size_t)-1 / 2) {
+        newcap = need;
+        break;
+      }
+      newcap *= 2;
+    }
+    char *tmp = (char *)realloc(*path, newcap);
+    if (!tmp) {
+      append_errorf(out, "Out of memory while tracking output directory");
+      return 0;
+    }
+    *path = tmp;
+    *cap = newcap;
+  }
+  if (*len > 0)
+    (*path)[(*len)++] = '/';
+  memcpy(*path + *len, part, part_len);
+  *len += part_len;
+  (*path)[*len] = 0;
+  return 1;
+}
+
 static int open_or_create_dir_path(int root_fd, const char *dir_path,
-                                   StrBuf *out) {
+                                   CreatedList *created, StrBuf *out) {
   if (!dir_path || !*dir_path)
     return dup(root_fd);
 
@@ -202,13 +298,36 @@ static int open_or_create_dir_path(int root_fd, const char *dir_path,
     return -1;
   }
 
+  char *current_path = NULL;
+  size_t current_len = 0;
+  size_t current_cap = 0;
   char *saveptr = NULL;
   for (char *part = strtok_r(tmp, "/", &saveptr); part;
        part = strtok_r(NULL, "/", &saveptr)) {
-    if (mkdirat(dir_fd, part, 0777) < 0 && errno != EEXIST) {
+    if (!append_component_path(&current_path, &current_len, &current_cap, part,
+                               out)) {
+      close(dir_fd);
+      free(current_path);
+      free(tmp);
+      return -1;
+    }
+
+    int made_dir = 0;
+    if (mkdirat(dir_fd, part, 0777) == 0) {
+      made_dir = 1;
+    } else if (errno != EEXIST) {
       append_errorf(out, "Failed to create directory '%s': %s", dir_path,
                     strerror(errno));
       close(dir_fd);
+      free(current_path);
+      free(tmp);
+      return -1;
+    }
+
+    if (made_dir && !created_list_add(created, current_path, 1, out)) {
+      (void)unlinkat(dir_fd, part, AT_REMOVEDIR);
+      close(dir_fd);
+      free(current_path);
       free(tmp);
       return -1;
     }
@@ -219,6 +338,7 @@ static int open_or_create_dir_path(int root_fd, const char *dir_path,
       append_errorf(out, "Failed to open directory '%s': %s", dir_path,
                     strerror(errno));
       close(dir_fd);
+      free(current_path);
       free(tmp);
       return -1;
     }
@@ -226,12 +346,13 @@ static int open_or_create_dir_path(int root_fd, const char *dir_path,
     dir_fd = next_fd;
   }
 
+  free(current_path);
   free(tmp);
   return dir_fd;
 }
 
 static int open_parent_dir(int root_fd, const char *path, char **basename,
-                           StrBuf *out) {
+                           CreatedList *created, StrBuf *out) {
   *basename = NULL;
   const char *slash = strrchr(path, '/');
   if (!slash) {
@@ -254,7 +375,7 @@ static int open_parent_dir(int root_fd, const char *path, char **basename,
     return -1;
   }
 
-  int fd = open_or_create_dir_path(root_fd, parent, out);
+  int fd = open_or_create_dir_path(root_fd, parent, created, out);
   free(parent);
   if (fd < 0) {
     free(*basename);
@@ -294,16 +415,17 @@ static int pwrite_full(int fd, const void *buf, size_t len,
 
 static int extract_regular_file(struct archive *archive,
                                 struct archive_entry *entry, int root_fd,
-                                const char *path, StrBuf *out) {
+                                const char *path, CreatedList *created,
+                                StrBuf *out) {
   (void)entry;
   char *basename = NULL;
-  int parent_fd = open_parent_dir(root_fd, path, &basename, out);
+  int parent_fd = open_parent_dir(root_fd, path, &basename, created, out);
   if (parent_fd < 0)
     return 0;
 
   int file_fd =
       openat(parent_fd, basename,
-             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0666);
+             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0666);
   if (file_fd < 0) {
     append_errorf(out, "Failed to create extracted file '%s': %s", path,
                   strerror(errno));
@@ -344,6 +466,10 @@ static int extract_regular_file(struct archive *archive,
 
   close(parent_fd);
   free(basename);
+  if (ok && !created_list_add(created, path, 0, out)) {
+    (void)unlinkat(root_fd, path, 0);
+    return 0;
+  }
   return ok;
 }
 
@@ -397,6 +523,7 @@ int polyglot_extract_plain_zip(const char *src_path,
   int src_fd = -1;
   int root_fd = -1;
   struct archive *archive = NULL;
+  CreatedList created = {0};
   ZipReader zr;
   memset(&zr, 0, sizeof(zr));
   zr.fd = -1;
@@ -493,13 +620,13 @@ int polyglot_extract_plain_zip(const char *src_path,
     mode_t filetype = archive_entry_filetype(entry);
     int ok = 0;
     if (filetype == AE_IFDIR) {
-      int dir_fd = open_or_create_dir_path(root_fd, path, out);
+      int dir_fd = open_or_create_dir_path(root_fd, path, &created, out);
       if (dir_fd >= 0) {
         close(dir_fd);
         ok = 1;
       }
     } else if (filetype == AE_IFREG) {
-      ok = extract_regular_file(archive, entry, root_fd, path, out);
+      ok = extract_regular_file(archive, entry, root_fd, path, &created, out);
     } else {
       append_errorf(out, "Unsupported ZIP entry type for '%s'", path);
     }
@@ -513,8 +640,11 @@ int polyglot_extract_plain_zip(const char *src_path,
   rc = 0;
 
 cleanup:
+  if (rc != 0 && root_fd >= 0)
+    rollback_created_outputs(root_fd, &created);
   if (archive)
     (void)archive_read_free(archive);
+  created_list_free(&created);
   free(zr.buf);
   if (root_fd >= 0)
     close(root_fd);
