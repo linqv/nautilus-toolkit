@@ -16,6 +16,8 @@ int run_extract_for_file(const char *filepath, const char *outdir,
                          int task_total, int *global_progress_floor);
 
 int archive_has_legacy_gbk_zip_names(const char *filepath);
+int archive_needs_legacy_gbk_zip_fallback(const char *filepath,
+                                          const char *listing);
 
 int run_extract_gbk_zip_for_file(const char *filepath, const char *outdir,
                                  FILE *progress_pipe, double start_pct,

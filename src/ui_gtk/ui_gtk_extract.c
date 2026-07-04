@@ -463,7 +463,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
       pre_probe_rc = run_7z_probe_password_fast(archive_path, NULL, NULL, 0,
                                                  &pre_listing, 0);
     }
-    if (legacy_gbk_zip && pre_probe_rc == 1) {
+    if (pre_probe_rc == 1 &&
+        archive_needs_legacy_gbk_zip_fallback(archive_path, pre_listing.data)) {
       legacy_gbk_zip_unencrypted = 1;
       log_msg("Legacy GBK ZIP filename fallback enabled: %s", filepath);
     }

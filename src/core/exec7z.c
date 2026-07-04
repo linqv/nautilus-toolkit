@@ -181,6 +181,22 @@ static int zip_name_bytes_look_gbk(const unsigned char *name, size_t len) {
   return looks_gbk;
 }
 
+static int zip_extra_has_field(const unsigned char *extra, size_t len,
+                               uint16_t field_id) {
+  size_t off = 0;
+  while (off + 4 <= len) {
+    uint16_t id = le16(extra + off);
+    uint16_t size = le16(extra + off + 2);
+    off += 4;
+    if (size > len - off)
+      return 0;
+    if (id == field_id)
+      return 1;
+    off += size;
+  }
+  return 0;
+}
+
 int archive_has_legacy_gbk_zip_names(const char *filepath) {
   if (!filepath || !*filepath)
     return 0;
@@ -256,6 +272,7 @@ int archive_has_legacy_gbk_zip_names(const char *filepath) {
     uint16_t comment_len = le16(hdr + 32);
 
     unsigned char *name = NULL;
+    unsigned char *extra = NULL;
     if (name_len > 0) {
       name = (unsigned char *)malloc(name_len);
       if (!name)
@@ -264,21 +281,46 @@ int archive_has_legacy_gbk_zip_names(const char *filepath) {
         free(name);
         goto done;
       }
-      if (!(flags & 0x0800) && zip_name_bytes_look_gbk(name, name_len)) {
-        free(name);
-        result = 1;
-        goto done;
-      }
-      free(name);
     }
 
-    if (fseeko(f, (off_t)extra_len + (off_t)comment_len, SEEK_CUR) != 0)
+    if (extra_len > 0) {
+      extra = (unsigned char *)malloc(extra_len);
+      if (!extra) {
+        free(name);
+        goto done;
+      }
+      if (fread(extra, 1, extra_len, f) != extra_len) {
+        free(name);
+        free(extra);
+        goto done;
+      }
+    }
+
+    int has_unicode_path = zip_extra_has_field(extra, extra_len, 0x7075);
+    if (name && !(flags & 0x0800) && !has_unicode_path &&
+        zip_name_bytes_look_gbk(name, name_len)) {
+      free(name);
+      free(extra);
+      result = 1;
+      goto done;
+    }
+    free(name);
+    free(extra);
+
+    if (fseeko(f, (off_t)comment_len, SEEK_CUR) != 0)
       goto done;
   }
 
 done:
   fclose(f);
   return result;
+}
+
+int archive_needs_legacy_gbk_zip_fallback(const char *filepath,
+                                          const char *listing) {
+  if (!listing || !*listing)
+    return 0;
+  return archive_has_legacy_gbk_zip_names(filepath) && !is_valid_utf8(listing);
 }
 
 static pid_t spawn_capture_child(char **argv, int *out_fd) {
