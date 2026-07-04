@@ -6,6 +6,11 @@
    Returns: 1 = found, 0 = not found, -1 = error. */
 int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start);
 
+/* Find supported archive payload offset in a potential polyglot file.
+   Currently supports ZIP and RAR5 payloads.
+   Returns: 1 = found, 0 = not found, -1 = error. */
+int polyglot_find_archive_start(const char *filepath, uint64_t *archive_start);
+
 /* Copy bytes [zip_start, EOF) from src_path to dst_path.
    Returns: 0 = success, -1 = error. */
 int polyglot_copy_tail(const char *src_path, uint64_t zip_start,
@@ -19,6 +24,16 @@ int polyglot_copy_tail(const char *src_path, uint64_t zip_start,
 */
 int polyglot_make_temp_fixed_zip(const char *src_path, char **out_temp_path,
                                  uint64_t *out_zip_start);
+
+/* Build a temporary fixed archive file from a polyglot source.
+   Supports ZIP and RAR5 payloads.
+   Returns:
+     1  = temp fixed file created (out_temp_path owned by caller)
+     0  = not applicable (no archive found or already plain archive)
+    -1  = error
+*/
+int polyglot_make_temp_fixed_archive(const char *src_path, char **out_temp_path,
+                                     uint64_t *out_archive_start);
 
 /* Best-effort cleanup for temp file path created above. */
 void polyglot_cleanup_temp(char **temp_path);

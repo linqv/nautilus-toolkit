@@ -780,8 +780,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
             }
           }
 
-          int fix_rc =
-              polyglot_make_temp_fixed_zip(filepath, &fixed_path, &zip_start);
+          int fix_rc = polyglot_make_temp_fixed_archive(filepath, &fixed_path,
+                                                        &zip_start);
           if (fix_rc == 1 && fixed_path) {
             pipe_writef(write_fd, "# 检测到 polyglot，自动重试\n");
             log_msg("Polyglot fallback enabled: %s -> %s (zip_start=%llu)",

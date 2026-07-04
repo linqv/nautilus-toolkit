@@ -114,6 +114,77 @@ static int zip_local_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
   return 1;
 }
 
+static int read_rar5_vint(const unsigned char *buf, size_t len, uint64_t *value,
+                          size_t *used) {
+  if (!buf || !value || !used)
+    return 0;
+  uint64_t result = 0;
+  unsigned shift = 0;
+  for (size_t i = 0; i < len && i < 10; i++) {
+    unsigned char b = buf[i];
+    if (shift >= 64 && (b & 0x7f) != 0)
+      return 0;
+    result |= ((uint64_t)(b & 0x7f)) << shift;
+    if ((b & 0x80) == 0) {
+      *value = result;
+      *used = i + 1;
+      return 1;
+    }
+    shift += 7;
+  }
+  return 0;
+}
+
+static int rar5_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
+  static const unsigned char sig_rar5[] = {'R', 'a', 'r', '!', 0x1a,
+                                           0x07, 0x01, 0x00};
+  unsigned char header[64];
+  if (!f || pos > file_size || file_size - pos < 15)
+    return 0;
+  size_t to_read = sizeof(header);
+  if (file_size - pos < (uint64_t)to_read)
+    to_read = (size_t)(file_size - pos);
+  if (seek_read(f, pos, header, to_read) != 0)
+    return 0;
+  if (memcmp(header, sig_rar5, sizeof(sig_rar5)) != 0)
+    return 0;
+
+  size_t off = sizeof(sig_rar5) + 4; /* signature + header CRC */
+  uint64_t header_size = 0;
+  size_t used_size = 0;
+  if (!read_rar5_vint(header + off, to_read - off, &header_size, &used_size))
+    return 0;
+  off += used_size;
+  if (header_size < 2 || header_size > (1U << 20))
+    return 0;
+  uint64_t header_data_start = pos + sizeof(sig_rar5) + 4 + used_size;
+  if (header_data_start < pos || header_size > file_size - header_data_start)
+    return 0;
+
+  uint64_t header_type = 0;
+  size_t used_type = 0;
+  if (!read_rar5_vint(header + off, to_read - off, &header_type, &used_type))
+    return 0;
+  off += used_type;
+  uint64_t header_flags = 0;
+  size_t used_flags = 0;
+  if (!read_rar5_vint(header + off, to_read - off, &header_flags, &used_flags))
+    return 0;
+  (void)header_flags;
+
+  if (header_type < 1 || header_type > 5)
+    return 0;
+  if ((uint64_t)(used_type + used_flags) > header_size)
+    return 0;
+  return 1;
+}
+
+static int supported_archive_header_valid(FILE *f, uint64_t pos,
+                                          uint64_t file_size) {
+  return zip_local_header_valid(f, pos, file_size) ||
+         rar5_header_valid(f, pos, file_size);
+}
+
 static int parse_mp4_atoms(FILE *f, uint64_t file_size, uint64_t *video_end) {
   if (!f || !video_end)
     return -1;
@@ -275,6 +346,59 @@ static int find_zip_start_scan(FILE *f, uint64_t file_size,
   return 0;
 }
 
+static int find_archive_start_scan(FILE *f, uint64_t file_size,
+                                   uint64_t *archive_start_out) {
+  if (!f || !archive_start_out)
+    return 0;
+  const unsigned char sig_local[4] = {'P', 'K', 0x03, 0x04};
+  const unsigned char sig_rar5[8] = {'R', 'a', 'r', '!', 0x1a,
+                                     0x07, 0x01, 0x00};
+  const size_t chunk_size = 8U * 1024U * 1024U;
+  unsigned char *buf = (unsigned char *)malloc(chunk_size + 7);
+  if (!buf)
+    return 0;
+
+  uint64_t pos = 0;
+  size_t carry = 0;
+  while (pos < file_size) {
+    size_t to_read = chunk_size;
+    if (file_size - pos < (uint64_t)to_read)
+      to_read = (size_t)(file_size - pos);
+
+    if (fseeko(f, (off_t)pos, SEEK_SET) != 0)
+      break;
+    size_t n = fread(buf + carry, 1, to_read, f);
+    if (n == 0)
+      break;
+
+    size_t total = carry + n;
+    for (size_t i = 0; i < total; i++) {
+      int sig_match =
+          (i + sizeof(sig_local) <= total &&
+           memcmp(buf + i, sig_local, sizeof(sig_local)) == 0) ||
+          (i + sizeof(sig_rar5) <= total &&
+           memcmp(buf + i, sig_rar5, sizeof(sig_rar5)) == 0);
+      if (sig_match) {
+        uint64_t abs = (pos - (uint64_t)carry) + (uint64_t)i;
+        if (abs < file_size &&
+            supported_archive_header_valid(f, abs, file_size)) {
+          *archive_start_out = abs;
+          free(buf);
+          return 1;
+        }
+      }
+    }
+
+    carry = (total >= 7) ? 7 : total;
+    if (carry > 0)
+      memmove(buf, buf + (total - carry), carry);
+    pos += (uint64_t)n;
+  }
+
+  free(buf);
+  return 0;
+}
+
 int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start) {
   if (!filepath || !zip_start)
     return -1;
@@ -315,6 +439,50 @@ int polyglot_find_zip_start(const char *filepath, uint64_t *zip_start) {
   }
 
   if (find_zip_start_scan(f, file_size, zip_start)) {
+    fclose(f);
+    return 1;
+  }
+
+  fclose(f);
+  return 0;
+}
+
+int polyglot_find_archive_start(const char *filepath, uint64_t *archive_start) {
+  if (!filepath || !archive_start)
+    return -1;
+  *archive_start = 0;
+
+  int zip_rc = polyglot_find_zip_start(filepath, archive_start);
+  if (zip_rc != 0)
+    return zip_rc;
+
+  uint64_t file_size = 0;
+  if (read_file_size(filepath, &file_size) != 0 || file_size < 4)
+    return 0;
+
+  FILE *f = fopen(filepath, "rb");
+  if (!f)
+    return -1;
+
+  if (rar5_header_valid(f, 0, file_size)) {
+    *archive_start = 0;
+    fclose(f);
+    return 1;
+  }
+
+  unsigned char head[8] = {0};
+  if (seek_read(f, 0, head, 8) == 0 && memcmp(head + 4, "ftyp", 4) == 0) {
+    uint64_t video_end = 0;
+    if (parse_mp4_atoms(f, file_size, &video_end) == 0 && video_end > 0 &&
+        video_end < file_size &&
+        supported_archive_header_valid(f, video_end, file_size)) {
+      *archive_start = video_end;
+      fclose(f);
+      return 1;
+    }
+  }
+
+  if (find_archive_start_scan(f, file_size, archive_start)) {
     fclose(f);
     return 1;
   }
@@ -444,6 +612,36 @@ int polyglot_make_temp_fixed_zip(const char *src_path, char **out_temp_path,
   *out_temp_path = tmp_path;
   if (out_zip_start)
     *out_zip_start = zip_start;
+  return 1;
+}
+
+int polyglot_make_temp_fixed_archive(const char *src_path, char **out_temp_path,
+                                     uint64_t *out_archive_start) {
+  if (!src_path || !out_temp_path)
+    return -1;
+  *out_temp_path = NULL;
+  if (out_archive_start)
+    *out_archive_start = 0;
+
+  uint64_t archive_start = 0;
+  int find_rc = polyglot_find_archive_start(src_path, &archive_start);
+  if (find_rc <= 0)
+    return find_rc;
+  if (archive_start == 0)
+    return 0;
+
+  char *tmp_path = make_temp_path(src_path);
+  if (!tmp_path)
+    return -1;
+  if (polyglot_copy_tail(src_path, archive_start, tmp_path) != 0) {
+    unlink(tmp_path);
+    free(tmp_path);
+    return -1;
+  }
+
+  *out_temp_path = tmp_path;
+  if (out_archive_start)
+    *out_archive_start = archive_start;
   return 1;
 }
 

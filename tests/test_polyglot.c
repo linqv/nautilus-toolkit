@@ -63,6 +63,69 @@ static void test_ignores_false_mp4_tail_zip_signature(void) {
   unlink(tmpl);
 }
 
+static void test_finds_rar5_polyglot_archive_start(void) {
+  char tmpl[] = "/tmp/ntk-polyglot-rar5-XXXXXX";
+  int fd = mkstemp(tmpl);
+  if (fd < 0) {
+    fprintf(stderr, "mkstemp failed\n");
+    failures++;
+    return;
+  }
+
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    fprintf(stderr, "fdopen failed\n");
+    failures++;
+    return;
+  }
+
+  put_be32(f, 16);
+  fwrite("ftypisom0000", 1, 12, f);
+  put_be32(f, 8);
+  fwrite("mdat", 1, 4, f);
+  long rar_start = ftell(f);
+  static const unsigned char rar5_tail[] = {
+      'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00,
+      0xce, 0xf0, 0x15, 0x59, 0x02, 0x04, 0x00,
+  };
+  fwrite(rar5_tail, 1, sizeof(rar5_tail), f);
+  fclose(f);
+
+  uint64_t zip_start = 123;
+  expect_int("RAR5 polyglot is not ZIP",
+             polyglot_find_zip_start(tmpl, &zip_start), 0);
+  expect_int("RAR5 ZIP start reset", (int)zip_start, 0);
+
+  uint64_t archive_start = 0;
+  expect_int("RAR5 polyglot archive detected",
+             polyglot_find_archive_start(tmpl, &archive_start), 1);
+  expect_int("RAR5 archive start", (int)archive_start, (int)rar_start);
+
+  char *fixed = NULL;
+  uint64_t fixed_start = 0;
+  expect_int("RAR5 fixed archive created",
+             polyglot_make_temp_fixed_archive(tmpl, &fixed, &fixed_start), 1);
+  expect_int("RAR5 fixed start", (int)fixed_start, (int)rar_start);
+  if (fixed) {
+    FILE *fixed_file = fopen(fixed, "rb");
+    if (!fixed_file) {
+      fprintf(stderr, "failed to open fixed RAR5 temp\n");
+      failures++;
+    } else {
+      unsigned char sig[8] = {0};
+      fread(sig, 1, sizeof(sig), fixed_file);
+      fclose(fixed_file);
+      expect_int("fixed RAR5 signature",
+                 memcmp(sig, rar5_tail, sizeof(sig)) == 0, 1);
+    }
+    polyglot_cleanup_temp(&fixed);
+  }
+
+  unlink(tmpl);
+}
+
 static void test_retry_policy_allows_embedded_zip_parse_errors(void) {
   const char *err =
       "Open ERROR: Cannot open the file as [zip] archive\n"
@@ -100,6 +163,7 @@ static void test_retry_policy_allows_empty_probe_output(void) {
 
 int main(void) {
   test_ignores_false_mp4_tail_zip_signature();
+  test_finds_rar5_polyglot_archive_start();
   test_retry_policy_allows_embedded_zip_parse_errors();
   test_retry_policy_skips_environmental_errors();
   test_retry_policy_skips_truncated_archive_errors();
