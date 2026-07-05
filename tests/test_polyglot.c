@@ -23,6 +23,58 @@ static void put_be32(FILE *f, uint32_t v) {
   fputc((int)(v & 0xff), f);
 }
 
+static void put_le16(FILE *f, uint16_t v) {
+  fputc((int)(v & 0xff), f);
+  fputc((int)((v >> 8) & 0xff), f);
+}
+
+static void put_le32(FILE *f, uint32_t v) {
+  fputc((int)(v & 0xff), f);
+  fputc((int)((v >> 8) & 0xff), f);
+  fputc((int)((v >> 16) & 0xff), f);
+  fputc((int)((v >> 24) & 0xff), f);
+}
+
+static void put_le64(FILE *f, uint64_t v) {
+  for (int i = 0; i < 8; i++)
+    fputc((int)((v >> (i * 8)) & 0xff), f);
+}
+
+static long write_mp4_prefix(FILE *f) {
+  put_be32(f, 16);
+  fwrite("ftypisom0000", 1, 12, f);
+  put_be32(f, 8);
+  fwrite("mdat", 1, 4, f);
+  return ftell(f);
+}
+
+static void write_zip_local_header(FILE *f, uint16_t version_needed,
+                                   uint16_t flags, uint16_t method,
+                                   uint32_t compressed_size,
+                                   uint32_t uncompressed_size,
+                                   const char *name,
+                                   const unsigned char *extra,
+                                   uint16_t extra_len,
+                                   const unsigned char *data,
+                                   size_t data_len) {
+  put_le32(f, 0x04034b50u);
+  put_le16(f, version_needed);
+  put_le16(f, flags);
+  put_le16(f, method);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le32(f, 0);
+  put_le32(f, compressed_size);
+  put_le32(f, uncompressed_size);
+  put_le16(f, (uint16_t)strlen(name));
+  put_le16(f, extra_len);
+  fwrite(name, 1, strlen(name), f);
+  if (extra_len > 0)
+    fwrite(extra, 1, extra_len, f);
+  if (data_len > 0)
+    fwrite(data, 1, data_len, f);
+}
+
 static void test_ignores_false_mp4_tail_zip_signature(void) {
   char tmpl[] = "/tmp/ntk-polyglot-false-XXXXXX";
   int fd = mkstemp(tmpl);
@@ -59,6 +111,93 @@ static void test_ignores_false_mp4_tail_zip_signature(void) {
   int rc = polyglot_find_zip_start(tmpl, &zip_start);
   expect_int("false MP4 tail ZIP signature ignored", rc, 0);
   expect_int("false MP4 tail ZIP start reset", (int)zip_start, 0);
+
+  unlink(tmpl);
+}
+
+static void test_finds_winzip_aes_zip_method(void) {
+  char tmpl[] = "/tmp/ntk-polyglot-aes-zip-XXXXXX";
+  int fd = mkstemp(tmpl);
+  if (fd < 0) {
+    fprintf(stderr, "mkstemp failed\n");
+    failures++;
+    return;
+  }
+
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    fprintf(stderr, "fdopen failed\n");
+    failures++;
+    return;
+  }
+
+  long zip_start = write_mp4_prefix(f);
+  static const unsigned char aes_extra[] = {
+      0x01, 0x99, 0x07, 0x00, 0x02, 0x00, 'A', 'E', 0x03, 0x08, 0x00};
+  static const unsigned char payload[] = {0xde, 0xad, 0xbe, 0xef};
+  write_zip_local_header(f, 20, 1, 99, sizeof(payload), sizeof(payload),
+                         "207.zip", aes_extra, sizeof(aes_extra), payload,
+                         sizeof(payload));
+  fclose(f);
+
+  uint64_t found = 0;
+  expect_int("WinZip AES ZIP method detected",
+             polyglot_find_zip_start(tmpl, &found), 1);
+  expect_int("WinZip AES ZIP start", (int)found, (int)zip_start);
+
+  unlink(tmpl);
+}
+
+static void test_finds_zip64_local_header_sizes(void) {
+  char tmpl[] = "/tmp/ntk-polyglot-zip64-XXXXXX";
+  int fd = mkstemp(tmpl);
+  if (fd < 0) {
+    fprintf(stderr, "mkstemp failed\n");
+    failures++;
+    return;
+  }
+
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    fprintf(stderr, "fdopen failed\n");
+    failures++;
+    return;
+  }
+
+  long zip_start = write_mp4_prefix(f);
+  unsigned char zip64_extra[20];
+  zip64_extra[0] = 0x01;
+  zip64_extra[1] = 0x00;
+  zip64_extra[2] = 0x10;
+  zip64_extra[3] = 0x00;
+  for (size_t i = 4; i < sizeof(zip64_extra); i++)
+    zip64_extra[i] = 0;
+  FILE *mem = fmemopen(zip64_extra + 4, sizeof(zip64_extra) - 4, "wb");
+  if (!mem) {
+    fclose(f);
+    unlink(tmpl);
+    fprintf(stderr, "fmemopen failed\n");
+    failures++;
+    return;
+  }
+  put_le64(mem, 4);
+  put_le64(mem, 4);
+  fclose(mem);
+
+  static const unsigned char payload[] = {0xde, 0xad, 0xbe, 0xef};
+  write_zip_local_header(f, 45, 0x0800, 8, 0xffffffffu, 0xffffffffu,
+                         "[3D] demo.zip", zip64_extra, sizeof(zip64_extra),
+                         payload, sizeof(payload));
+  fclose(f);
+
+  uint64_t found = 0;
+  expect_int("ZIP64 local header sizes detected",
+             polyglot_find_zip_start(tmpl, &found), 1);
+  expect_int("ZIP64 ZIP start", (int)found, (int)zip_start);
 
   unlink(tmpl);
 }
@@ -163,6 +302,8 @@ static void test_retry_policy_allows_empty_probe_output(void) {
 
 int main(void) {
   test_ignores_false_mp4_tail_zip_signature();
+  test_finds_winzip_aes_zip_method();
+  test_finds_zip64_local_header_sizes();
   test_finds_rar5_polyglot_archive_start();
   test_retry_policy_allows_embedded_zip_parse_errors();
   test_retry_policy_skips_environmental_errors();

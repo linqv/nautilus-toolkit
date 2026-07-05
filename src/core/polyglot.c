@@ -76,7 +76,58 @@ static int seek_read(FILE *f, uint64_t pos, unsigned char *buf, size_t n) {
 static int zip_method_looks_plausible(uint16_t method) {
   return method == 0 || method == 1 || method == 6 || method == 8 ||
          method == 9 || method == 12 || method == 14 || method == 93 ||
-         method == 95 || method == 98;
+         method == 95 || method == 98 || method == 99;
+}
+
+static int zip_extra_find_field(const unsigned char *extra, size_t extra_len,
+                                uint16_t field_id,
+                                const unsigned char **field_data,
+                                size_t *field_len) {
+  if (!extra || !field_data || !field_len)
+    return 0;
+
+  size_t off = 0;
+  while (off + 4 <= extra_len) {
+    uint16_t id = read_le16(extra + off);
+    uint16_t len = read_le16(extra + off + 2);
+    off += 4;
+    if (len > extra_len - off)
+      return 0;
+    if (id == field_id) {
+      *field_data = extra + off;
+      *field_len = len;
+      return 1;
+    }
+    off += len;
+  }
+
+  return 0;
+}
+
+static int zip64_extra_read_compressed_size(const unsigned char *extra,
+                                            size_t extra_len,
+                                            uint32_t uncompressed_size32,
+                                            uint32_t compressed_size32,
+                                            uint64_t *compressed_size_out) {
+  if (!compressed_size_out || compressed_size32 != UINT32_MAX)
+    return 0;
+
+  const unsigned char *field = NULL;
+  size_t field_len = 0;
+  if (!zip_extra_find_field(extra, extra_len, 0x0001, &field, &field_len))
+    return 0;
+
+  size_t off = 0;
+  if (uncompressed_size32 == UINT32_MAX) {
+    if (field_len - off < 8)
+      return 0;
+    off += 8;
+  }
+
+  if (field_len - off < 8)
+    return 0;
+  *compressed_size_out = read_le64(field + off);
+  return 1;
 }
 
 static int zip_local_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
@@ -93,6 +144,7 @@ static int zip_local_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
   uint16_t flags = read_le16(header + 6);
   uint16_t method = read_le16(header + 8);
   uint32_t compressed_size = read_le32(header + 18);
+  uint32_t uncompressed_size = read_le32(header + 22);
   uint16_t name_len = read_le16(header + 26);
   uint16_t extra_len = read_le16(header + 28);
   if (version_needed < 10 || version_needed > 63)
@@ -105,12 +157,29 @@ static int zip_local_header_valid(FILE *f, uint64_t pos, uint64_t file_size) {
   uint64_t data_start = pos + sizeof(header);
   if (data_start < pos || name_len > file_size - data_start)
     return 0;
-  data_start += name_len;
-  if (extra_len > file_size - data_start)
+  uint64_t extra_start = data_start + name_len;
+  if (extra_len > file_size - extra_start)
     return 0;
-  data_start += extra_len;
-  if ((flags & 0x0008u) == 0 && compressed_size > file_size - data_start)
-    return 0;
+  data_start = extra_start + extra_len;
+  if ((flags & 0x0008u) == 0) {
+    uint64_t effective_compressed_size = compressed_size;
+    if (compressed_size == UINT32_MAX) {
+      if (extra_len == 0)
+        return 0;
+      unsigned char *extra = (unsigned char *)malloc(extra_len);
+      if (!extra)
+        return 0;
+      int ok = seek_read(f, extra_start, extra, extra_len) == 0 &&
+               zip64_extra_read_compressed_size(
+                   extra, extra_len, uncompressed_size, compressed_size,
+                   &effective_compressed_size);
+      free(extra);
+      if (!ok)
+        return 0;
+    }
+    if (effective_compressed_size > file_size - data_start)
+      return 0;
+  }
   return 1;
 }
 
