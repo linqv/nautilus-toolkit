@@ -2,6 +2,7 @@
 #include "pwdlib.h"
 #include "strbuf.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /* ── Password variant (encoding fallback) ── */
 typedef struct {
@@ -80,6 +81,10 @@ char *determine_output_dir_with_listing(const char *filepath,
 int try_password_list(const char *filepath, PwdVec *v, char **hit, int jobs,
                       StrBuf *listing_out, TryPasswordProgressFn progress_cb,
                       void *progress_ud);
+int try_password_list_polyglot_zip(const char *filepath, uint64_t zip_start,
+                                   PwdVec *v, char **hit,
+                                   TryPasswordProgressFn progress_cb,
+                                   void *progress_ud);
 char *build_file_fingerprint(const char *filepath);
 void ignore_sigpipe_once(void);
 int dependency_in_path(const char *dep);

@@ -4,11 +4,13 @@
 #include "strbuf.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -76,6 +78,59 @@ static void write_mp4_prefix(FILE *f) {
   fwrite("ftypisom0000", 1, 12, f);
   put_be32(f, 8);
   fwrite("mdat", 1, 4, f);
+}
+
+static int copy_file_bytes(FILE *dst, const char *src_path) {
+  FILE *src = fopen(src_path, "rb");
+  if (!src)
+    return 0;
+  unsigned char buf[8192];
+  int ok = 1;
+  for (;;) {
+    size_t n = fread(buf, 1, sizeof(buf), src);
+    if (n > 0 && fwrite(buf, 1, n, dst) != n) {
+      ok = 0;
+      break;
+    }
+    if (n < sizeof(buf)) {
+      if (ferror(src))
+        ok = 0;
+      break;
+    }
+  }
+  fclose(src);
+  return ok;
+}
+
+static int run_7z_create_aes_zip(const char *workdir, const char *zip_path,
+                                 const char *entry_name,
+                                 const char *password) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return -1;
+  if (pid == 0) {
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    if (chdir(workdir) != 0)
+      _exit(127);
+    char pass_arg[256];
+    snprintf(pass_arg, sizeof(pass_arg), "-p%s", password);
+    char *args[] = {"7z", "a", "-tzip", "-mem=AES256", pass_arg,
+                    (char *)zip_path, (char *)entry_name, NULL};
+    execvp("7z", args);
+    _exit(127);
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return -1;
+  if (!WIFEXITED(status))
+    return -1;
+  return WEXITSTATUS(status);
 }
 
 static long write_zip_payload_with_flags(FILE *f, const char *name,
@@ -267,6 +322,80 @@ static char *make_polyglot_file_entries(const char *tag,
   }
   if (zip_start_out)
     *zip_start_out = (uint64_t)zip_start;
+  return strdup(tmpl);
+}
+
+static char *make_aes_polyglot_file(const char *tag, const char *entry,
+                                    const char *text, const char *password,
+                                    uint64_t *zip_start_out,
+                                    char **workdir_out) {
+  char *workdir = make_temp_dir(tag);
+  if (!workdir)
+    return NULL;
+
+  char entry_path[512];
+  snprintf(entry_path, sizeof(entry_path), "%s/%s", workdir, entry);
+  FILE *entry_file = fopen(entry_path, "wb");
+  if (!entry_file) {
+    rmdir(workdir);
+    free(workdir);
+    return NULL;
+  }
+  fwrite(text, 1, strlen(text), entry_file);
+  fclose(entry_file);
+
+  char zip_path[512];
+  snprintf(zip_path, sizeof(zip_path), "%s/archive.zip", workdir);
+  if (run_7z_create_aes_zip(workdir, zip_path, entry, password) != 0) {
+    unlink(entry_path);
+    rmdir(workdir);
+    free(workdir);
+    return NULL;
+  }
+
+  char tmpl[256];
+  snprintf(tmpl, sizeof(tmpl), "/tmp/ntk-polyglot-zip-%s-XXXXXX.mp4", tag);
+  int fd = mkstemps(tmpl, 4);
+  if (fd < 0) {
+    unlink(zip_path);
+    unlink(entry_path);
+    rmdir(workdir);
+    free(workdir);
+    return NULL;
+  }
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    unlink(zip_path);
+    unlink(entry_path);
+    rmdir(workdir);
+    free(workdir);
+    return NULL;
+  }
+  write_mp4_prefix(f);
+  long zip_start = ftell(f);
+  int ok = copy_file_bytes(f, zip_path);
+  fclose(f);
+  if (!ok) {
+    unlink(tmpl);
+    unlink(zip_path);
+    unlink(entry_path);
+    rmdir(workdir);
+    free(workdir);
+    return NULL;
+  }
+
+  if (zip_start_out)
+    *zip_start_out = (uint64_t)zip_start;
+  if (workdir_out)
+    *workdir_out = workdir;
+  else {
+    unlink(zip_path);
+    unlink(entry_path);
+    rmdir(workdir);
+    free(workdir);
+  }
   return strdup(tmpl);
 }
 
@@ -468,6 +597,78 @@ static void test_encrypted_flag_fails_without_output(void) {
   free(outdir);
 }
 
+static void test_extracts_aes_zip_with_password_without_copy(void) {
+  uint64_t zip_start = 0;
+  char *workdir = NULL;
+  char *src = make_aes_polyglot_file("aes", "secret.txt", "secret\n",
+                                     "correct horse", &zip_start, &workdir);
+  char *outdir = make_temp_dir("aes-out");
+  if (!src || !outdir || !workdir) {
+    fprintf(stderr, "aes setup failed\n");
+    failures++;
+    free(src);
+    free(outdir);
+    free(workdir);
+    return;
+  }
+
+  StrBuf out;
+  sb_init(&out);
+  int rc = polyglot_extract_zip_with_password(
+      src, zip_start, outdir, "correct horse", NULL, 0.0, 100.0, &out,
+      "aes.mp4", 1, 1, NULL);
+  expect_int("AES extraction with password", rc, 0);
+
+  char extracted[512];
+  snprintf(extracted, sizeof(extracted), "%s/secret.txt", outdir);
+  expect_file_text(extracted, "secret\n");
+
+  unlink(extracted);
+  rmdir(outdir);
+  char zip_path[512];
+  snprintf(zip_path, sizeof(zip_path), "%s/archive.zip", workdir);
+  char entry_path[512];
+  snprintf(entry_path, sizeof(entry_path), "%s/secret.txt", workdir);
+  unlink(zip_path);
+  unlink(entry_path);
+  rmdir(workdir);
+  unlink(src);
+  sb_free(&out);
+  free(src);
+  free(outdir);
+  free(workdir);
+}
+
+static void test_probes_aes_zip_password_at_offset(void) {
+  uint64_t zip_start = 0;
+  char *workdir = NULL;
+  char *src = make_aes_polyglot_file("aes-probe", "secret.txt", "secret\n",
+                                     "correct horse", &zip_start, &workdir);
+  if (!src || !workdir) {
+    fprintf(stderr, "aes probe setup failed\n");
+    failures++;
+    free(src);
+    free(workdir);
+    return;
+  }
+
+  expect_int("AES probe wrong password",
+             polyglot_probe_zip_password(src, zip_start, "wrong"), 0);
+  expect_int("AES probe correct password",
+             polyglot_probe_zip_password(src, zip_start, "correct horse"), 1);
+
+  char zip_path[512];
+  snprintf(zip_path, sizeof(zip_path), "%s/archive.zip", workdir);
+  char entry_path[512];
+  snprintf(entry_path, sizeof(entry_path), "%s/secret.txt", workdir);
+  unlink(zip_path);
+  unlink(entry_path);
+  rmdir(workdir);
+  unlink(src);
+  free(src);
+  free(workdir);
+}
+
 int main(void) {
   test_extracts_plain_zip_without_copy();
   test_extracts_nested_file();
@@ -476,5 +677,7 @@ int main(void) {
   test_rejects_absolute_path();
   test_unsupported_method_fails_without_output();
   test_encrypted_flag_fails_without_output();
+  test_extracts_aes_zip_with_password_without_copy();
+  test_probes_aes_zip_password_at_offset();
   return failures == 0 ? 0 : 1;
 }

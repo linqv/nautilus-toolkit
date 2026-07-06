@@ -491,17 +491,113 @@ static void emit_completion_progress(FILE *progress_pipe, double start_pct,
     *global_progress_floor = done_pct;
 }
 
-int polyglot_extract_plain_zip(const char *src_path,
-                               uint64_t zip_start,
-                               const char *outdir,
-                               FILE *progress_pipe,
-                               double start_pct,
-                               double slot_size,
-                               StrBuf *out,
-                               const char *archive_label,
-                               int task_index,
-                               int task_total,
-                               int *global_progress_floor) {
+int polyglot_probe_zip_password(const char *src_path, uint64_t zip_start,
+                                const char *password) {
+  if (!src_path || !password || !*password)
+    return 0;
+
+  int result = -1;
+  int src_fd = -1;
+  struct archive *archive = NULL;
+  ZipReader zr;
+  memset(&zr, 0, sizeof(zr));
+  zr.fd = -1;
+  zr.buf_size = 64 * 1024;
+
+  src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
+  if (src_fd < 0)
+    goto cleanup;
+
+  struct stat st;
+  if (fstat(src_fd, &st) < 0)
+    goto cleanup;
+  if (st.st_size < 0 || zip_start > (uint64_t)st.st_size)
+    goto cleanup;
+
+  zr.fd = src_fd;
+  zr.zip_start = zip_start;
+  zr.zip_size = (uint64_t)st.st_size - zip_start;
+  if (zr.zip_size > (uint64_t)INT64_MAX)
+    goto cleanup;
+  zr.buf = (unsigned char *)malloc(zr.buf_size);
+  if (!zr.buf)
+    goto cleanup;
+
+  archive = archive_read_new();
+  if (!archive)
+    goto cleanup;
+  if (archive_read_support_filter_none(archive) != ARCHIVE_OK ||
+      archive_read_support_format_zip(archive) != ARCHIVE_OK ||
+      archive_read_set_read_callback(archive, zip_read_cb) != ARCHIVE_OK ||
+      archive_read_set_seek_callback(archive, zip_seek_cb) != ARCHIVE_OK ||
+      archive_read_set_callback_data(archive, &zr) != ARCHIVE_OK ||
+      archive_read_add_passphrase(archive, password) != ARCHIVE_OK) {
+    goto cleanup;
+  }
+
+  if (lseek(src_fd, (off_t)zip_start, SEEK_SET) < 0)
+    goto cleanup;
+  if (archive_read_open1(archive) != ARCHIVE_OK)
+    goto cleanup;
+
+  result = 0;
+  struct archive_entry *entry = NULL;
+  for (;;) {
+    int r = archive_read_next_header(archive, &entry);
+    if (r == ARCHIVE_EOF) {
+      result = 1;
+      break;
+    }
+    if (r != ARCHIVE_OK) {
+      result = 0;
+      break;
+    }
+
+    if (archive_entry_filetype(entry) != AE_IFREG) {
+      (void)archive_read_data_skip(archive);
+      continue;
+    }
+
+    for (;;) {
+      const void *block = NULL;
+      size_t size = 0;
+      la_int64_t offset = 0;
+      r = archive_read_data_block(archive, &block, &size, &offset);
+      (void)block;
+      (void)size;
+      (void)offset;
+      if (r == ARCHIVE_EOF) {
+        result = 1;
+        goto cleanup;
+      }
+      if (r != ARCHIVE_OK) {
+        result = 0;
+        goto cleanup;
+      }
+    }
+  }
+
+cleanup:
+  if (archive)
+    (void)archive_read_free(archive);
+  free(zr.buf);
+  if (src_fd >= 0)
+    close(src_fd);
+  return result;
+}
+
+int polyglot_extract_zip_with_password(const char *src_path,
+                                       uint64_t zip_start,
+                                       const char *outdir,
+                                       const char *password,
+                                       FILE *progress_pipe,
+                                       double start_pct,
+                                       double slot_size,
+                                       StrBuf *out,
+                                       const char *archive_label,
+                                       int task_index,
+                                       int task_total,
+                                       int *global_progress_floor) {
   if (!src_path || !outdir) {
     append_errorf(out, "Invalid ZIP extraction arguments");
     return 127;
@@ -520,6 +616,7 @@ int polyglot_extract_plain_zip(const char *src_path,
   }
 
   int rc = 95;
+  int has_password = password && *password;
   int src_fd = -1;
   int root_fd = -1;
   struct archive *archive = NULL;
@@ -580,6 +677,14 @@ int polyglot_extract_plain_zip(const char *src_path,
                       : "archive configuration error");
     goto cleanup;
   }
+  if (has_password &&
+      archive_read_add_passphrase(archive, password) != ARCHIVE_OK) {
+    append_errorf(out, "Failed to configure ZIP passphrase: %s",
+                  archive_error_string(archive)
+                      ? archive_error_string(archive)
+                      : "archive passphrase error");
+    goto cleanup;
+  }
   if (lseek(src_fd, (off_t)zip_start, SEEK_SET) < 0) {
     append_errorf(out, "Failed to seek to embedded ZIP payload: %s",
                   strerror(errno));
@@ -607,8 +712,8 @@ int polyglot_extract_plain_zip(const char *src_path,
     }
 
     int encrypted = archive_entry_is_encrypted(entry);
-    if (encrypted != 0) {
-      append_errorf(out, "Encrypted ZIP entry is not supported");
+    if (encrypted != 0 && !has_password) {
+      append_errorf(out, "Encrypted ZIP entry requires passphrase");
       goto cleanup;
     }
 
@@ -651,4 +756,20 @@ cleanup:
   if (src_fd >= 0)
     close(src_fd);
   return rc;
+}
+
+int polyglot_extract_plain_zip(const char *src_path,
+                               uint64_t zip_start,
+                               const char *outdir,
+                               FILE *progress_pipe,
+                               double start_pct,
+                               double slot_size,
+                               StrBuf *out,
+                               const char *archive_label,
+                               int task_index,
+                               int task_total,
+                               int *global_progress_floor) {
+  return polyglot_extract_zip_with_password(
+      src_path, zip_start, outdir, NULL, progress_pipe, start_pct, slot_size,
+      out, archive_label, task_index, task_total, global_progress_floor);
 }

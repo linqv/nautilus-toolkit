@@ -773,6 +773,83 @@ gpointer ui_gtk_worker_func(gpointer data) {
           uint64_t zip_start = 0;
           char *fixed_path = NULL;
           int find_rc = polyglot_find_zip_start(filepath, &zip_start);
+          if (find_rc == 1 && zip_start > 0 && use_password &&
+              password_to_use && *password_to_use) {
+            int fast_outdir_created_by_us = 0;
+            int fast_outdir_existed_before = 0;
+            if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                       &fast_outdir_created_by_us,
+                                       &fast_outdir_existed_before)) {
+              pipe_writef(write_fd,
+                          "# 检测到加密 polyglot ZIP，使用快速模式\n");
+              log_msg("Polyglot encrypted ZIP zero-copy fallback enabled: %s "
+                      "(zip_start=%llu, outdir_existed=%d)",
+                      filepath, (unsigned long long)zip_start,
+                      fast_outdir_existed_before);
+
+              PwdVarVec vars;
+              varvec_init(&vars);
+              build_password_variants(password_to_use, &vars);
+              int fast_hit = -1;
+              StrBuf fast_out;
+              sb_init(&fast_out);
+              for (size_t k = 0; k < vars.len &&
+                                 !g_atomic_int_get(&ctx->cancelled);
+                   k++) {
+                if (!vars.data[k].bytes)
+                  continue;
+                fast_out.len = 0;
+                if (fast_out.data)
+                  fast_out.data[0] = 0;
+                int fast_ec = polyglot_extract_zip_with_password(
+                    filepath, zip_start, outdir, vars.data[k].bytes,
+                    pipe_stream, start_pct, slot_size, &fast_out, filename,
+                    i + 1, total, &progress_floor);
+                if (fast_ec == 0) {
+                  fast_hit = (int)k;
+                  break;
+                }
+              }
+
+              if (fast_hit >= 0) {
+                log_msg("Polyglot encrypted ZIP zero-copy fallback succeeded: %s",
+                        filepath);
+                success = 1;
+                if (!cached_password || !*cached_password) {
+                  free(cached_password);
+                  cached_password = str_dup(password_to_use);
+                }
+                hit_cache_put(&hit_cache, fingerprint, password_to_use);
+                bump_password_hit(&ctx->password_lib, password_to_use);
+                if (vars.data[fast_hit].transcoded)
+                  log_msg("Password matched via legacy encoding fallback");
+                if (manual_pwd && strcmp(password_to_use, manual_pwd) == 0)
+                  need_save_pwd = 1;
+                final_password = str_dup(password_to_use);
+                success_count++;
+                varvec_free(&vars);
+                sb_free(&fast_out);
+                sb_free(&out);
+                dir_snapshot_free(&outdir_snapshot);
+                break;
+              }
+
+              log_msg("Polyglot encrypted ZIP zero-copy fallback failed: %s",
+                      fast_out.data ? fast_out.data : "(no output)");
+              varvec_free(&vars);
+              sb_free(&fast_out);
+              if (fast_outdir_created_by_us) {
+                remove_tree(outdir, parent);
+                free(outdir);
+                outdir = NULL;
+                outdir_with_password = 0;
+                outdir_needs_password_recheck = 0;
+              }
+            } else {
+              log_msg("Polyglot encrypted ZIP zero-copy fallback skipped: "
+                      "cannot prepare outdir");
+            }
+          }
           if (find_rc == 1 && zip_start > 0 && !use_password) {
             int fast_outdir_created_by_us = 0;
             int fast_outdir_existed_before = 0;
@@ -813,6 +890,143 @@ gpointer ui_gtk_worker_func(gpointer data) {
             } else {
               log_msg("Polyglot zero-copy ZIP fallback skipped: cannot prepare "
                       "outdir");
+            }
+          }
+          if (find_rc == 1 && zip_start > 0 && !use_password &&
+              !tried_tryall && pwd_mode == PWD_MODE_TRYALL &&
+              !g_atomic_int_get(&ctx->cancelled)) {
+            tried_tryall = 1;
+            log_msg("worker: entering polyglot zip tryall for %s", filename);
+            if (total > 1)
+              pipe_writef(write_fd, "# [%d/%d] 正在撞库: %s\n", i + 1,
+                          total, filename);
+            else
+              pipe_writef(write_fd, "# 正在撞库: %s\n", filename);
+
+            TryAllProgressCtx tryall_prog = {
+                .write_fd = write_fd,
+                .task_index = i + 1,
+                .task_total = total,
+                .start_pct = start_pct,
+                .slot_size = slot_size,
+                .last_global_pct = -1,
+                .last_local_pct = -1};
+            char *hit = NULL;
+            int r = try_password_list_polyglot_zip(
+                filepath, zip_start, &ctx->password_lib, &hit,
+                tryall_progress_cb, &tryall_prog);
+            if (r == 1 && hit) {
+              free(password_to_use);
+              password_to_use = hit;
+              hit = NULL;
+              use_password = 1;
+
+              if (!outdir) {
+                if (custom_dest) {
+                  outdir = str_dup(custom_dest);
+                } else {
+                  char *stem = path_stem(filepath);
+                  if (stem && parent) {
+                    StrBuf tmp;
+                    sb_init(&tmp);
+                    sb_append(&tmp, parent, strlen(parent));
+                    sb_append_c(&tmp, '/');
+                    sb_append(&tmp, stem, strlen(stem));
+                    outdir = tmp.data;
+                  }
+                  free(stem);
+                }
+              }
+
+              int fast_outdir_created_by_us = 0;
+              int fast_outdir_existed_before = 0;
+              if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                         &fast_outdir_created_by_us,
+                                         &fast_outdir_existed_before)) {
+                pipe_writef(write_fd,
+                            "# 密码库命中，使用 polyglot ZIP 快速模式\n");
+                log_msg("Polyglot ZIP tryall hit, zero-copy extraction "
+                        "enabled: %s (zip_start=%llu, outdir_existed=%d)",
+                        filepath, (unsigned long long)zip_start,
+                        fast_outdir_existed_before);
+
+                PwdVarVec vars;
+                varvec_init(&vars);
+                build_password_variants(password_to_use, &vars);
+                int fast_hit = -1;
+                StrBuf fast_out;
+                sb_init(&fast_out);
+                for (size_t k = 0; k < vars.len &&
+                                   !g_atomic_int_get(&ctx->cancelled);
+                     k++) {
+                  if (!vars.data[k].bytes)
+                    continue;
+                  fast_out.len = 0;
+                  if (fast_out.data)
+                    fast_out.data[0] = 0;
+                  int fast_ec = polyglot_extract_zip_with_password(
+                      filepath, zip_start, outdir, vars.data[k].bytes,
+                      pipe_stream, start_pct, slot_size, &fast_out, filename,
+                      i + 1, total, &progress_floor);
+                  if (fast_ec == 0) {
+                    fast_hit = (int)k;
+                    break;
+                  }
+                }
+
+                if (fast_hit >= 0) {
+                  log_msg("Polyglot ZIP tryall zero-copy extraction "
+                          "succeeded: %s",
+                          filepath);
+                  success = 1;
+                  if (!cached_password || !*cached_password) {
+                    free(cached_password);
+                    cached_password = str_dup(password_to_use);
+                  }
+                  hit_cache_put(&hit_cache, fingerprint, password_to_use);
+                  bump_password_hit(&ctx->password_lib, password_to_use);
+                  if (vars.data[fast_hit].transcoded)
+                    log_msg("Password matched via legacy encoding fallback");
+                  if (manual_pwd && strcmp(password_to_use, manual_pwd) == 0)
+                    need_save_pwd = 1;
+                  final_password = str_dup(password_to_use);
+                  success_count++;
+                  varvec_free(&vars);
+                  sb_free(&fast_out);
+                  sb_free(&out);
+                  dir_snapshot_free(&outdir_snapshot);
+                  break;
+                }
+
+                log_msg("Polyglot ZIP tryall zero-copy extraction failed: %s",
+                        fast_out.data ? fast_out.data : "(no output)");
+                varvec_free(&vars);
+                sb_free(&fast_out);
+                if (fast_outdir_created_by_us) {
+                  remove_tree(outdir, parent);
+                  free(outdir);
+                  outdir = NULL;
+                  outdir_with_password = 0;
+                  outdir_needs_password_recheck = 0;
+                }
+              } else {
+                log_msg("Polyglot ZIP tryall zero-copy extraction skipped: "
+                        "cannot prepare outdir");
+              }
+            } else if (r == 0) {
+              log_msg("Polyglot ZIP tryall found no matching password: %s",
+                      filepath);
+              free(hit);
+              update_failure_reason(&failure_reason, "需要密码", 255,
+                                    g_atomic_int_get(&ctx->cancelled), 1);
+              sb_free(&out);
+              dir_snapshot_free(&outdir_snapshot);
+              break;
+            } else {
+              log_msg("Polyglot ZIP tryall probe failed, falling back to "
+                      "temporary fixed archive: %s",
+                      filepath);
+              free(hit);
             }
           }
 

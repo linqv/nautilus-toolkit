@@ -5,6 +5,7 @@
 #include "fsutil.h"
 #include "log.h"
 #include "path.h"
+#include "polyglot_zip_extract.h"
 #include "pwdlib.h"
 #include "strbuf.h"
 
@@ -1625,6 +1626,61 @@ int try_password_list(const char *filepath, PwdVec *v, char **hit, int jobs,
   candvec_free(&cands);
 
   return result;
+}
+
+int try_password_list_polyglot_zip(const char *filepath, uint64_t zip_start,
+                                   PwdVec *v, char **hit,
+                                   TryPasswordProgressFn progress_cb,
+                                   void *progress_ud) {
+  if (hit)
+    *hit = NULL;
+  if (!filepath || !v || v->len == 0)
+    return 0;
+
+  PwdTryCandidateVec cands;
+  if (!build_try_candidates(v, &cands))
+    return -1;
+  if (cands.len == 0) {
+    candvec_free(&cands);
+    return 0;
+  }
+
+  int total_candidates = (int)cands.len;
+  int attempted_candidates = 0;
+  report_try_progress(progress_cb, progress_ud, 0, total_candidates);
+
+  for (size_t i = 0; i < cands.len; i++) {
+    if (run_7z_is_cancel_requested()) {
+      candvec_free(&cands);
+      return -1;
+    }
+
+    int r =
+        polyglot_probe_zip_password(filepath, zip_start, cands.data[i].bytes);
+    attempted_candidates++;
+    report_try_progress(progress_cb, progress_ud, attempted_candidates,
+                        total_candidates);
+
+    if (r == 1) {
+      if (hit) {
+        *hit = str_dup(cands.data[i].origin_pwd);
+        if (!*hit) {
+          candvec_free(&cands);
+          return -1;
+        }
+      }
+      candvec_free(&cands);
+      return 1;
+    }
+
+    if (r < 0) {
+      candvec_free(&cands);
+      return -1;
+    }
+  }
+
+  candvec_free(&cands);
+  return 0;
 }
 
 /* 旧 UI 主流程已删除，仅保留 GTK UI 构建路径。 */
