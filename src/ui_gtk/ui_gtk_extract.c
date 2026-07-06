@@ -130,7 +130,7 @@ static char *compose_failure_reason(const char *out, int exit_code,
     return str_dup("密码错误或未找到可用密码");
 
   if (out && *out) {
-    if (need_password_from_output(out))
+    if (extraction_error_may_need_password(out, 0))
       return str_dup("密码错误或需要密码");
     if (strstr(out, "No space left on device") ||
         strstr(out, "not enough space"))
@@ -668,7 +668,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
               used_transcoded = vars.data[probe_hit].transcoded;
               free(extract_locale_used);
               extract_locale_used = str_dup(vars.data[probe_hit].locale);
-            } else if (!need_password_from_output(out.data ? out.data : "")) {
+            } else if (!extraction_error_may_need_password(
+                           out.data ? out.data : "", 1)) {
               non_pwd_error = 1;
             }
           }
@@ -703,7 +704,8 @@ gpointer ui_gtk_worker_func(gpointer data) {
           }
           if (last_ec == 0)
             success = 1;
-          else if (!need_password_from_output(out.data ? out.data : ""))
+          else if (!extraction_error_may_need_password(
+                       out.data ? out.data : "", 0))
             non_pwd_error = 1;
         }
       }
@@ -743,16 +745,22 @@ gpointer ui_gtk_worker_func(gpointer data) {
       log_msg("Failed: %s (exit=%d, non_pwd=%d, cancelled=%d)",
               filename, last_ec, non_pwd_error,
               g_atomic_int_get(&ctx->cancelled));
-      if (out.data && !need_password_from_output(out.data)) {
-        size_t tail_len = out.len > 512 ? 512 : out.len;
+      if (out.data && out.len > 0) {
+        size_t tail_len = out.len > 4096 ? 4096 : out.len;
         const char *tail = out.data + out.len - tail_len;
         log_msg("7z output(tail): %.*s", (int)tail_len, tail);
       }
 
       log_msg("worker: before remove_tree (outdir=%s)", outdir ? outdir : "(null)");
       /* Only clean up the auto-generated directory this attempt created. */
-      if (outdir_created_by_us)
+      if (outdir_created_by_us &&
+          extract_failure_should_cleanup_output(
+              non_pwd_error, g_atomic_int_get(&ctx->cancelled))) {
         remove_tree(outdir, parent);
+      } else if (outdir_created_by_us) {
+        log_msg("worker: preserving partial output after non-password error: %s",
+                outdir ? outdir : "(null)");
+      }
       log_msg("worker: after remove_tree");
 
       if (non_pwd_error) {

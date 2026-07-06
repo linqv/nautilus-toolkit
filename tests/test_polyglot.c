@@ -293,6 +293,13 @@ static void test_retry_policy_skips_truncated_archive_errors(void) {
              0);
 }
 
+static void test_retry_policy_skips_crc_archive_errors(void) {
+  expect_int("CRC failures are not retryable",
+             polyglot_should_try_after_7z_error("CRC Failed"), 0);
+  expect_int("data errors are not retryable",
+             polyglot_should_try_after_7z_error("Data Error"), 0);
+}
+
 static void test_retry_policy_allows_empty_probe_output(void) {
   expect_int("empty probe output is retryable",
              polyglot_should_try_after_7z_error(""), 1);
@@ -308,6 +315,7 @@ int main(void) {
   test_retry_policy_allows_embedded_zip_parse_errors();
   test_retry_policy_skips_environmental_errors();
   test_retry_policy_skips_truncated_archive_errors();
+  test_retry_policy_skips_crc_archive_errors();
   test_retry_policy_allows_empty_probe_output();
 
   return failures == 0 ? 0 : 1;

@@ -55,6 +55,9 @@ void run_7z_clear_cancel_request(void);
 int run_7z_is_cancel_requested(void);
 
 int need_password_from_output(const char *out);
+int extraction_error_may_need_password(const char *out, int attempted_password);
+int extract_failure_should_cleanup_output(int non_password_error,
+                                          int cancelled);
 
 /* Probe password by streaming a specific encrypted file from the archive.
    This is used when headers are not encrypted and `7z l -p...` can return

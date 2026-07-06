@@ -440,6 +440,27 @@ static void test_bsdtar_gbk_probe_checks_passphrase(void) {
   free(bindir);
 }
 
+static void test_plain_crc_failure_does_not_request_password_retry(void) {
+  const char *crc_failure =
+      "ERROR: CRC Failed : 01/01_001.png\n"
+      "Sub items Errors: 1\n";
+  expect_int("plain CRC failure is not a password retry",
+             extraction_error_may_need_password(crc_failure, 0), 0);
+  expect_int("explicit password prompt is a password retry",
+             extraction_error_may_need_password("Enter password", 0), 1);
+  expect_int("CRC after trying a password remains password-related",
+             extraction_error_may_need_password(crc_failure, 1), 1);
+}
+
+static void test_non_password_failure_preserves_partial_output(void) {
+  expect_int("password failures clean generated output",
+             extract_failure_should_cleanup_output(0, 0), 1);
+  expect_int("cancelled extraction cleans generated output",
+             extract_failure_should_cleanup_output(1, 1), 1);
+  expect_int("non-password failures preserve generated output",
+             extract_failure_should_cleanup_output(1, 0), 0);
+}
+
 int main(void) {
   const unsigned char gbk_name[] = {
       0xb6, 0xe0, 0xc8, 0xcb, '.', 't', 'x', 't'};
@@ -488,6 +509,8 @@ int main(void) {
   test_7z_probe_rejects_zero_file_success();
   test_7z_progress_uses_raw_percent_mapping();
   test_bsdtar_gbk_probe_checks_passphrase();
+  test_plain_crc_failure_does_not_request_password_retry();
+  test_non_password_failure_preserves_partial_output();
 
   unlink(gbk_zip);
   unlink(encrypted_gbk_zip);

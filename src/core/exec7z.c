@@ -1916,22 +1916,60 @@ int run_7z_probe_password_fast(const char *filepath, const char *pwd_bytes,
   return -1;
 }
 
-int need_password_from_output(const char *out) {
+static int output_contains_any(const char *out, const char *const *keys,
+                               size_t nkeys) {
   if (!out)
     return 0;
-  const char *keys[] = {"Wrong password",    "Enter password",
-                        "encrypted archive", "Can not open encrypted archive",
-                        "Incorrect passphrase",
-                        "Too many incorrect passphrases",
-                        "CRC Failed",        "密码错误",
-                        "需要密码",          "请输入密码",
-                        "输入密码",          "加密文件",
-                        "加密档案"};
-  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+  for (size_t i = 0; i < nkeys; i++) {
     if (strstr(out, keys[i]))
       return 1;
   }
   return 0;
+}
+
+static int output_has_explicit_password_marker(const char *out) {
+  static const char *const keys[] = {
+      "Wrong password",
+      "Enter password",
+      "encrypted archive",
+      "Can not open encrypted archive",
+      "Incorrect passphrase",
+      "Too many incorrect passphrases",
+      "密码错误",
+      "需要密码",
+      "请输入密码",
+      "输入密码",
+      "加密文件",
+      "加密档案",
+  };
+  return output_contains_any(out, keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+static int output_has_weak_password_marker(const char *out) {
+  static const char *const keys[] = {
+      "CRC Failed",
+  };
+  return output_contains_any(out, keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+int need_password_from_output(const char *out) {
+  return output_has_explicit_password_marker(out) ||
+         output_has_weak_password_marker(out);
+}
+
+int extraction_error_may_need_password(const char *out, int attempted_password) {
+  if (output_has_explicit_password_marker(out))
+    return 1;
+  if (attempted_password && output_has_weak_password_marker(out))
+    return 1;
+  return 0;
+}
+
+int extract_failure_should_cleanup_output(int non_password_error,
+                                          int cancelled) {
+  if (cancelled)
+    return 1;
+  return !non_password_error;
 }
 
 /* Batch password verification: test multiple passwords in a single 7z process.

@@ -733,6 +733,8 @@ int polyglot_should_try_after_7z_error(const char *error_output) {
       "Access is denied",
       "No such file or directory",
       "Headers Error",
+      "CRC Failed",
+      "Data Error",
       "Unexpected end of data",
       "Unexpected end of archive",
   };
