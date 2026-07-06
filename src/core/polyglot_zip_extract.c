@@ -42,6 +42,52 @@ typedef struct {
   size_t cap;
 } CreatedList;
 
+typedef struct {
+  FILE *progress_pipe;
+  double start_pct;
+  double slot_size;
+  uint64_t total_bytes;
+  uint64_t done_bytes;
+  int *global_progress_floor;
+  int last_pct;
+  const char *archive_label;
+  int task_index;
+  int task_total;
+} ZipProgress;
+
+static uint16_t zip_le16(const unsigned char *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t zip_le32(const unsigned char *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t zip_le64(const unsigned char *p) {
+  return (uint64_t)zip_le32(p) | ((uint64_t)zip_le32(p + 4) << 32);
+}
+
+static int pread_full(int fd, uint64_t offset, void *buf, size_t len) {
+  if (offset > (uint64_t)INT64_MAX)
+    return 0;
+
+  unsigned char *p = (unsigned char *)buf;
+  size_t done = 0;
+  while (done < len) {
+    size_t chunk = len - done;
+    if (chunk > (size_t)SSIZE_MAX)
+      chunk = (size_t)SSIZE_MAX;
+    ssize_t n = pread(fd, p + done, chunk, (off_t)(offset + done));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return 0;
+    done += (size_t)n;
+  }
+  return 1;
+}
+
 static void append_errorf(StrBuf *out, const char *fmt, ...) {
   if (!out || !fmt)
     return;
@@ -413,10 +459,54 @@ static int pwrite_full(int fd, const void *buf, size_t len,
   return 1;
 }
 
+static void emit_zip_progress(ZipProgress *progress) {
+  if (!progress || !progress->progress_pipe || progress->total_bytes == 0)
+    return;
+
+  double local =
+      (double)progress->done_bytes / (double)progress->total_bytes;
+  if (local < 0.0)
+    local = 0.0;
+  if (local > 1.0)
+    local = 1.0;
+
+  int pct = (int)(progress->start_pct + local * progress->slot_size);
+  if (pct < 0)
+    pct = 0;
+  if (pct > 99)
+    pct = 99;
+  if (progress->global_progress_floor &&
+      *progress->global_progress_floor >= 0 &&
+      pct < *progress->global_progress_floor) {
+    pct = *progress->global_progress_floor;
+  }
+  if (pct <= progress->last_pct)
+    return;
+
+  const char *label = (progress->archive_label && *progress->archive_label)
+                          ? progress->archive_label
+                          : "未知文件";
+  if (progress->task_total > 1 && progress->task_index > 0) {
+    fprintf(progress->progress_pipe, "# [%d/%d] 解压进度: %d%% (当前: %s)\n",
+            progress->task_index, progress->task_total, pct, label);
+  } else {
+    fprintf(progress->progress_pipe, "# 解压进度: %d%% (当前: %s)\n", pct,
+            label);
+  }
+  fprintf(progress->progress_pipe, "%d\n", pct);
+  fflush(progress->progress_pipe);
+
+  progress->last_pct = pct;
+  if (progress->global_progress_floor &&
+      pct > *progress->global_progress_floor) {
+    *progress->global_progress_floor = pct;
+  }
+}
+
 static int extract_regular_file(struct archive *archive,
                                 struct archive_entry *entry, int root_fd,
                                 const char *path, CreatedList *created,
-                                StrBuf *out) {
+                                StrBuf *out, ZipProgress *progress) {
   (void)entry;
   char *basename = NULL;
   int parent_fd = open_parent_dir(root_fd, path, &basename, created, out);
@@ -454,6 +544,14 @@ static int extract_regular_file(struct archive *archive,
       ok = 0;
       break;
     }
+    if (progress && size > 0) {
+      uint64_t add = (uint64_t)size;
+      if (add > UINT64_MAX - progress->done_bytes)
+        progress->done_bytes = UINT64_MAX;
+      else
+        progress->done_bytes += add;
+      emit_zip_progress(progress);
+    }
   }
 
   if (close(file_fd) < 0) {
@@ -471,6 +569,236 @@ static int extract_regular_file(struct archive *archive,
     return 0;
   }
   return ok;
+}
+
+static int zip64_extra_uncompressed_size(const unsigned char *extra,
+                                         size_t extra_len,
+                                         uint32_t uncompressed32,
+                                         uint32_t compressed32,
+                                         uint32_t local_header_offset32,
+                                         uint16_t disk_start16,
+                                         uint64_t *size_out) {
+  if (!size_out || uncompressed32 != UINT32_MAX)
+    return 0;
+
+  size_t pos = 0;
+  while (pos + 4 <= extra_len) {
+    uint16_t field_id = zip_le16(extra + pos);
+    uint16_t field_size = zip_le16(extra + pos + 2);
+    pos += 4;
+    if (field_size > extra_len - pos)
+      return 0;
+
+    if (field_id == 0x0001) {
+      const unsigned char *field = extra + pos;
+      size_t field_pos = 0;
+      if (field_size < 8)
+        return 0;
+      *size_out = zip_le64(field);
+      field_pos += 8;
+      if (compressed32 == UINT32_MAX) {
+        if (field_size - field_pos < 8)
+          return 0;
+        field_pos += 8;
+      }
+      if (local_header_offset32 == UINT32_MAX) {
+        if (field_size - field_pos < 8)
+          return 0;
+        field_pos += 8;
+      }
+      if (disk_start16 == UINT16_MAX) {
+        if (field_size - field_pos < 4)
+          return 0;
+      }
+      return 1;
+    }
+
+    pos += field_size;
+  }
+
+  return 0;
+}
+
+static int zip_entry_name_looks_directory(int fd, uint64_t name_offset,
+                                          uint16_t name_len,
+                                          uint32_t external_attrs) {
+  if (((external_attrs >> 16) & S_IFMT) == S_IFDIR)
+    return 1;
+  if ((external_attrs & 0x10U) != 0)
+    return 1;
+  if (name_len == 0)
+    return 0;
+
+  unsigned char last = 0;
+  if (!pread_full(fd, name_offset + (uint64_t)name_len - 1, &last, 1))
+    return 0;
+  return last == '/' || last == '\\';
+}
+
+static uint64_t estimate_uncompressed_size_from_cd(int fd, uint64_t zip_start,
+                                                   uint64_t zip_size) {
+  if (zip_size < 22)
+    return 0;
+
+  size_t scan_len = zip_size < 66000 ? (size_t)zip_size : 66000;
+  unsigned char *scan = (unsigned char *)malloc(scan_len);
+  if (!scan)
+    return 0;
+  uint64_t scan_offset = zip_start + zip_size - scan_len;
+  if (scan_offset < zip_start || !pread_full(fd, scan_offset, scan, scan_len)) {
+    free(scan);
+    return 0;
+  }
+
+  size_t eocd_pos = (size_t)-1;
+  for (size_t i = scan_len - 22;; i--) {
+    if (scan[i] == 'P' && scan[i + 1] == 'K' && scan[i + 2] == 0x05 &&
+        scan[i + 3] == 0x06) {
+      uint16_t comment_len = zip_le16(scan + i + 20);
+      if (i + 22u + comment_len == scan_len) {
+        eocd_pos = i;
+        break;
+      }
+    }
+    if (i == 0)
+      break;
+  }
+  if (eocd_pos == (size_t)-1) {
+    free(scan);
+    return 0;
+  }
+
+  unsigned char *eocd = scan + eocd_pos;
+  uint16_t disk_no = zip_le16(eocd + 4);
+  uint16_t cd_disk = zip_le16(eocd + 6);
+  uint16_t entries_on_disk16 = zip_le16(eocd + 8);
+  uint16_t entries16 = zip_le16(eocd + 10);
+  uint64_t cd_size = zip_le32(eocd + 12);
+  uint64_t cd_offset = zip_le32(eocd + 16);
+  uint64_t entry_count = entries16;
+  uint64_t logical_eocd_offset = zip_size - scan_len + eocd_pos;
+  int needs_zip64 = disk_no == UINT16_MAX || cd_disk == UINT16_MAX ||
+                    entries_on_disk16 == UINT16_MAX ||
+                    entries16 == UINT16_MAX ||
+                    cd_size == UINT32_MAX || cd_offset == UINT32_MAX;
+  free(scan);
+
+  if (needs_zip64) {
+    if (logical_eocd_offset < 20)
+      return 0;
+    unsigned char locator[20];
+    if (!pread_full(fd, zip_start + logical_eocd_offset - 20, locator,
+                    sizeof(locator)) ||
+        zip_le32(locator) != 0x07064b50U) {
+      return 0;
+    }
+    if (zip_le32(locator + 4) != 0 || zip_le32(locator + 16) > 1)
+      return 0;
+    uint64_t zip64_eocd_offset = zip_le64(locator + 8);
+    if (zip64_eocd_offset > zip_size || zip_size - zip64_eocd_offset < 56)
+      return 0;
+
+    unsigned char zip64[56];
+    if (!pread_full(fd, zip_start + zip64_eocd_offset, zip64, sizeof(zip64)) ||
+        zip_le32(zip64) != 0x06064b50U) {
+      return 0;
+    }
+    if (zip_le32(zip64 + 16) != 0 || zip_le32(zip64 + 20) != 0)
+      return 0;
+    uint64_t entries_on_disk = zip_le64(zip64 + 24);
+    entry_count = zip_le64(zip64 + 32);
+    if (entries_on_disk != entry_count)
+      return 0;
+    cd_size = zip_le64(zip64 + 40);
+    cd_offset = zip_le64(zip64 + 48);
+  } else if (disk_no != 0 || cd_disk != 0 || entries_on_disk16 != entries16) {
+    return 0;
+  }
+
+  if (cd_offset > zip_size || cd_size > zip_size - cd_offset)
+    return 0;
+
+  uint64_t total = 0;
+  uint64_t pos = cd_offset;
+  uint64_t cd_end = cd_offset + cd_size;
+  for (uint64_t i = 0; i < entry_count; i++) {
+    if (cd_end - pos < 46)
+      return 0;
+
+    unsigned char hdr[46];
+    if (!pread_full(fd, zip_start + pos, hdr, sizeof(hdr)) ||
+        zip_le32(hdr) != 0x02014b50U) {
+      return 0;
+    }
+
+    uint32_t compressed32 = zip_le32(hdr + 20);
+    uint32_t uncompressed32 = zip_le32(hdr + 24);
+    uint16_t name_len = zip_le16(hdr + 28);
+    uint16_t extra_len = zip_le16(hdr + 30);
+    uint16_t comment_len = zip_le16(hdr + 32);
+    uint16_t disk_start16 = zip_le16(hdr + 34);
+    uint32_t external_attrs = zip_le32(hdr + 38);
+    uint32_t local_header_offset32 = zip_le32(hdr + 42);
+    pos += 46;
+
+    uint64_t variable_len =
+        (uint64_t)name_len + (uint64_t)extra_len + (uint64_t)comment_len;
+    if (variable_len > cd_end - pos)
+      return 0;
+
+    int is_dir =
+        zip_entry_name_looks_directory(fd, zip_start + pos, name_len,
+                                       external_attrs);
+    uint64_t entry_size = uncompressed32;
+    if (uncompressed32 == UINT32_MAX) {
+      if (extra_len == 0)
+        return 0;
+      unsigned char *extra = (unsigned char *)malloc(extra_len);
+      if (!extra)
+        return 0;
+      int ok = pread_full(fd, zip_start + pos + name_len, extra, extra_len) &&
+               zip64_extra_uncompressed_size(
+                   extra, extra_len, uncompressed32, compressed32,
+                   local_header_offset32, disk_start16, &entry_size);
+      free(extra);
+      if (!ok)
+        return 0;
+    }
+
+    if (!is_dir && entry_size > 0) {
+      if (entry_size > UINT64_MAX - total)
+        return 0;
+      total += entry_size;
+    }
+
+    pos += variable_len;
+  }
+
+  return total;
+}
+
+uint64_t polyglot_zip_estimate_uncompressed_size(const char *src_path,
+                                                 uint64_t zip_start) {
+  uint64_t total = 0;
+  int src_fd = -1;
+
+  src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
+  if (src_fd < 0)
+    goto cleanup;
+
+  struct stat st;
+  if (fstat(src_fd, &st) < 0)
+    goto cleanup;
+  if (st.st_size < 0 || zip_start > (uint64_t)st.st_size)
+    goto cleanup;
+
+  total = estimate_uncompressed_size_from_cd(
+      src_fd, zip_start, (uint64_t)st.st_size - zip_start);
+
+cleanup:
+  if (src_fd >= 0)
+    close(src_fd);
+  return total;
 }
 
 static void emit_completion_progress(FILE *progress_pipe, double start_pct,
@@ -661,6 +989,21 @@ int polyglot_extract_zip_with_password(const char *src_path,
   if (root_fd < 0)
     goto cleanup;
 
+  uint64_t progress_total =
+      polyglot_zip_estimate_uncompressed_size(src_path, zip_start);
+  ZipProgress progress = {
+      .progress_pipe = progress_pipe,
+      .start_pct = start_pct,
+      .slot_size = slot_size,
+      .total_bytes = progress_total,
+      .done_bytes = 0,
+      .global_progress_floor = global_progress_floor,
+      .last_pct = -1,
+      .archive_label = archive_label,
+      .task_index = task_index,
+      .task_total = task_total,
+  };
+
   archive = archive_read_new();
   if (!archive) {
     append_errorf(out, "Failed to allocate ZIP reader");
@@ -731,7 +1074,8 @@ int polyglot_extract_zip_with_password(const char *src_path,
         ok = 1;
       }
     } else if (filetype == AE_IFREG) {
-      ok = extract_regular_file(archive, entry, root_fd, path, &created, out);
+      ok = extract_regular_file(archive, entry, root_fd, path, &created, out,
+                                &progress);
     } else {
       append_errorf(out, "Unsupported ZIP entry type for '%s'", path);
     }

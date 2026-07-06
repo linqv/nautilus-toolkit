@@ -46,6 +46,20 @@ static void expect_path_missing(const char *name, const char *path) {
   failures++;
 }
 
+static void expect_file_size(const char *name, const char *path, off_t expected) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    fprintf(stderr, "%s: failed to stat %s: %s\n", name, path, strerror(errno));
+    failures++;
+    return;
+  }
+  if (st.st_size != expected) {
+    fprintf(stderr, "%s: expected size %lld, got %lld\n", name,
+            (long long)expected, (long long)st.st_size);
+    failures++;
+  }
+}
+
 static uint32_t crc32_bytes(const unsigned char *data, size_t len) {
   uint32_t crc = 0xFFFFFFFFU;
   for (size_t i = 0; i < len; i++) {
@@ -298,6 +312,42 @@ static char *make_polyglot_file(const char *tag, const char *entry,
   return strdup(tmpl);
 }
 
+static char *make_repeated_text(size_t len) {
+  char *text = (char *)malloc(len + 1);
+  if (!text)
+    return NULL;
+  for (size_t i = 0; i < len; i++)
+    text[i] = (char)('A' + (i % 26));
+  text[len] = 0;
+  return text;
+}
+
+static int progress_has_intermediate_value(const char *progress,
+                                           int lower_bound,
+                                           int upper_bound) {
+  if (!progress)
+    return 0;
+  char *copy = strdup(progress);
+  if (!copy)
+    return 0;
+  int found = 0;
+  char *saveptr = NULL;
+  for (char *line = strtok_r(copy, "\n", &saveptr); line;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    if (line[0] == '#')
+      continue;
+    char *endptr = NULL;
+    long value = strtol(line, &endptr, 10);
+    if (endptr != line && *endptr == '\0' &&
+        value > lower_bound && value < upper_bound) {
+      found = 1;
+      break;
+    }
+  }
+  free(copy);
+  return found;
+}
+
 static char *make_polyglot_file_entries(const char *tag,
                                         const TestZipEntry *entries,
                                         size_t entry_count,
@@ -449,6 +499,71 @@ static void test_extracts_nested_file(void) {
   rmdir(outdir);
   unlink(src);
   sb_free(&out);
+  free(src);
+  free(outdir);
+}
+
+static void test_reports_progress_while_extracting_plain_zip(void) {
+  const size_t payload_len = 1024 * 1024;
+  char *payload = make_repeated_text(payload_len);
+  if (!payload) {
+    fprintf(stderr, "progress payload allocation failed\n");
+    failures++;
+    return;
+  }
+
+  uint64_t zip_start = 0;
+  char *src = make_polyglot_file("progress", "large.bin", payload, 0,
+                                 &zip_start);
+  char *outdir = make_temp_dir("progress-out");
+  if (!src || !outdir) {
+    fprintf(stderr, "progress fixture setup failed\n");
+    failures++;
+    free(payload);
+    free(src);
+    free(outdir);
+    return;
+  }
+
+  char *progress = NULL;
+  size_t progress_len = 0;
+  FILE *progress_stream = open_memstream(&progress, &progress_len);
+  if (!progress_stream) {
+    fprintf(stderr, "progress memstream setup failed: %s\n", strerror(errno));
+    failures++;
+    free(payload);
+    unlink(src);
+    rmdir(outdir);
+    free(src);
+    free(outdir);
+    return;
+  }
+
+  StrBuf out;
+  sb_init(&out);
+  int floor = -1;
+  int rc = polyglot_extract_plain_zip(src, zip_start, outdir, progress_stream,
+                                      10.0, 80.0, &out, "progress.mp4", 1, 1,
+                                      &floor);
+  fclose(progress_stream);
+  expect_int("progress extraction", rc, 0);
+  if (!progress_has_intermediate_value(progress, 10, 90)) {
+    fprintf(stderr, "progress extraction: expected an intermediate progress "
+                    "value between 10 and 90, got:\n%s\n",
+            progress ? progress : "(null)");
+    failures++;
+  }
+
+  char extracted[512];
+  snprintf(extracted, sizeof(extracted), "%s/large.bin", outdir);
+  expect_file_size("progress output file", extracted, (off_t)payload_len);
+
+  unlink(extracted);
+  rmdir(outdir);
+  unlink(src);
+  sb_free(&out);
+  free(progress);
+  free(payload);
   free(src);
   free(outdir);
 }
@@ -639,6 +754,39 @@ static void test_extracts_aes_zip_with_password_without_copy(void) {
   free(workdir);
 }
 
+static void test_estimates_aes_zip_size_without_password(void) {
+  uint64_t zip_start = 0;
+  char *workdir = NULL;
+  const char *payload = "secret\n";
+  char *src = make_aes_polyglot_file("aes-size", "secret.txt", payload,
+                                     "correct horse", &zip_start, &workdir);
+  if (!src || !workdir) {
+    fprintf(stderr, "aes size setup failed\n");
+    failures++;
+    free(src);
+    free(workdir);
+    return;
+  }
+
+  uint64_t total = polyglot_zip_estimate_uncompressed_size(src, zip_start);
+  if (total != strlen(payload)) {
+    fprintf(stderr, "AES metadata size: expected %zu, got %llu\n",
+            strlen(payload), (unsigned long long)total);
+    failures++;
+  }
+
+  char zip_path[512];
+  snprintf(zip_path, sizeof(zip_path), "%s/archive.zip", workdir);
+  char entry_path[512];
+  snprintf(entry_path, sizeof(entry_path), "%s/secret.txt", workdir);
+  unlink(zip_path);
+  unlink(entry_path);
+  rmdir(workdir);
+  unlink(src);
+  free(src);
+  free(workdir);
+}
+
 static void test_probes_aes_zip_password_at_offset(void) {
   uint64_t zip_start = 0;
   char *workdir = NULL;
@@ -672,12 +820,14 @@ static void test_probes_aes_zip_password_at_offset(void) {
 int main(void) {
   test_extracts_plain_zip_without_copy();
   test_extracts_nested_file();
+  test_reports_progress_while_extracting_plain_zip();
   test_failed_extraction_removes_prior_outputs();
   test_rejects_parent_traversal();
   test_rejects_absolute_path();
   test_unsupported_method_fails_without_output();
   test_encrypted_flag_fails_without_output();
   test_extracts_aes_zip_with_password_without_copy();
+  test_estimates_aes_zip_size_without_password();
   test_probes_aes_zip_password_at_offset();
   return failures == 0 ? 0 : 1;
 }

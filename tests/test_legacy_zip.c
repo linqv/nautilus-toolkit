@@ -185,6 +185,25 @@ static void write_fake_7z_no_files(const char *dir) {
   free(path);
 }
 
+static void write_fake_7z_progress(const char *dir) {
+  char *path = join_path(dir, "7z");
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    perror(path);
+    exit(2);
+  }
+  fputs("#!/bin/sh\n"
+        "printf ' 60%%\\n'\n"
+        "exit 0\n",
+        f);
+  fclose(f);
+  if (chmod(path, 0755) != 0) {
+    perror(path);
+    exit(2);
+  }
+  free(path);
+}
+
 static void write_fake_bsdtar_probe(const char *dir) {
   char *path = join_path(dir, "bsdtar");
   FILE *f = fopen(path, "w");
@@ -248,6 +267,25 @@ static void expect_contains(const char *label, const char *haystack,
             haystack ? haystack : "(null)");
     exit(1);
   }
+}
+
+static int progress_stream_has_value(FILE *stream, int expected) {
+  fflush(stream);
+  rewind(stream);
+
+  char line[256];
+  while (fgets(line, sizeof(line), stream)) {
+    if (line[0] == '#')
+      continue;
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    char *endptr = NULL;
+    long value = strtol(line, &endptr, 10);
+    if (endptr != line && *endptr == '\0' && value == expected)
+      return 1;
+  }
+  return 0;
 }
 
 static char *prepend_temp_path(const char *bindir) {
@@ -339,6 +377,42 @@ static void test_7z_probe_rejects_zero_file_success(void) {
   free(bindir);
 }
 
+static void test_7z_progress_uses_raw_percent_mapping(void) {
+  char *bindir = temp_dir_path("fake-7z-progress-bin");
+  char *outdir = temp_dir_path("fake-7z-progress-out");
+  write_fake_7z_progress(bindir);
+  char *old_path_copy = prepend_temp_path(bindir);
+
+  FILE *progress = tmpfile();
+  if (!progress) {
+    perror("tmpfile");
+    exit(2);
+  }
+
+  StrBuf out;
+  sb_init(&out);
+  int floor = -1;
+  int rc = run_extract_for_file("archive.7z", outdir, "", NULL, progress, 10.0,
+                                80.0, &out, "archive.7z", 1, 1, &floor);
+  expect_int("7z fake progress extraction", rc, 0);
+  if (!progress_stream_has_value(progress, 58)) {
+    fprintf(stderr, "7z progress mapping: expected raw mapped progress 58; "
+                    "captured output did not contain it\n");
+    exit(1);
+  }
+
+  fclose(progress);
+  sb_free(&out);
+  restore_path(old_path_copy);
+  char *fake_7z = join_path(bindir, "7z");
+  unlink(fake_7z);
+  rmdir(outdir);
+  rmdir(bindir);
+  free(fake_7z);
+  free(outdir);
+  free(bindir);
+}
+
 static void test_bsdtar_gbk_probe_checks_passphrase(void) {
   char *bindir = temp_dir_path("fake-bsdtar-probe-bin");
   write_fake_bsdtar_probe(bindir);
@@ -412,6 +486,7 @@ int main(void) {
              archive_needs_password_before_extract(encrypted_gbk_zip), 1);
   test_gbk_extract_passes_password_to_bsdtar(gbk_zip);
   test_7z_probe_rejects_zero_file_success();
+  test_7z_progress_uses_raw_percent_mapping();
   test_bsdtar_gbk_probe_checks_passphrase();
 
   unlink(gbk_zip);

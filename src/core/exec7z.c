@@ -1144,7 +1144,7 @@ int run_7z_capture(char **args, int argn, StrBuf *out, int nonblock,
   int have_status = 0;
   int finished = 0;
   int last_local_pct = -1;
-  int ui_display_pct = 0;  /* Smoothed progress value sent to UI */
+  int last_global_pct = -1;
   PercentParser pct_parser;
   percent_parser_init(&pct_parser);
   const size_t tail_cap = 32768;
@@ -1220,42 +1220,26 @@ int run_7z_capture(char **args, int argn, StrBuf *out, int nonblock,
             global_pct = *global_progress_floor;
           }
 
-          /* Smoothing: gradually catch up to real progress.
-             Apply smoothing BEFORE comparing with last_global_pct to ensure
-             we output values incrementally even when 7z jumps from 0 to 60%. */
-          int step = (global_pct - ui_display_pct) / 3;
-          if (step < 1) step = 1;
-          if (step > 10) step = 10;  /* Cap max step to 10% */
-
-          int new_ui_pct = ui_display_pct + step;
-          if (new_ui_pct > global_pct)
-            new_ui_pct = global_pct;
-          if (new_ui_pct > 99)
-            new_ui_pct = 99;
-
-          /* Only update if there's actual progress */
-          if (new_ui_pct > ui_display_pct || pct != last_local_pct) {
-            ui_display_pct = new_ui_pct;
-
+          if (global_pct > last_global_pct || pct != last_local_pct) {
             const char *label = (archive_label && *archive_label)
                                     ? archive_label
                                     : "未知文件";
             if (task_total > 1 && task_index > 0) {
               fprintf(progress_pipe,
                       "# [%d/%d] 解压进度: %d%% (当前: %s, %d%%)\n", task_index,
-                      task_total, ui_display_pct, label, pct);
+                      task_total, global_pct, label, pct);
             } else {
               fprintf(progress_pipe, "# 解压进度: %d%% (当前: %s, %d%%)\n",
-                      ui_display_pct, label, pct);
+                      global_pct, label, pct);
             }
 
-            fprintf(progress_pipe, "%d\n", ui_display_pct);
+            fprintf(progress_pipe, "%d\n", global_pct);
             fflush(progress_pipe);
 
             last_local_pct = pct;
-            if (global_progress_floor &&
-                ui_display_pct > *global_progress_floor) {
-              *global_progress_floor = ui_display_pct;
+            last_global_pct = global_pct;
+            if (global_progress_floor && global_pct > *global_progress_floor) {
+              *global_progress_floor = global_pct;
             }
           }
         }

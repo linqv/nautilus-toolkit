@@ -28,6 +28,12 @@ int polyglot_probe_zip_password(const char *src_path,
                                 uint64_t zip_start,
                                 const char *password);
 
+/* Estimate total uncompressed regular-file bytes from ZIP central directory
+   metadata only. This does not read or decrypt entry data and does not require
+   a password. Returns 0 if the total cannot be determined. */
+uint64_t polyglot_zip_estimate_uncompressed_size(const char *src_path,
+                                                 uint64_t zip_start);
+
 /* Extract an unencrypted ZIP payload embedded at zip_start inside src_path.
    Returns 0 on success and nonzero on failure/unsupported input. */
 int polyglot_extract_plain_zip(const char *src_path,
