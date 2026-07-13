@@ -283,6 +283,100 @@ static long write_zip_payload_entries(FILE *f, const TestZipEntry *entries,
   return zip_start;
 }
 
+static long write_zip64_payload_with_eocd_locator(FILE *f, const char *name,
+                                                  const char *text,
+                                                  int locator_points_to_eocd) {
+  long zip_start = ftell(f);
+  size_t name_len = strlen(name);
+  size_t data_len = strlen(text);
+  uint32_t crc = crc32_bytes((const unsigned char *)text, data_len);
+
+  long local_offset = ftell(f) - zip_start;
+  put_le32(f, 0x04034b50U);
+  put_le16(f, 45);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le32(f, crc);
+  put_le32(f, UINT32_MAX);
+  put_le32(f, UINT32_MAX);
+  put_le16(f, (uint16_t)name_len);
+  put_le16(f, 20);
+  fwrite(name, 1, name_len, f);
+  put_le16(f, 0x0001);
+  put_le16(f, 16);
+  put_le32(f, (uint32_t)data_len);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)data_len);
+  put_le32(f, 0);
+  fwrite(text, 1, data_len, f);
+
+  long cd_offset = ftell(f) - zip_start;
+  put_le32(f, 0x02014b50U);
+  put_le16(f, 45);
+  put_le16(f, 45);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le32(f, crc);
+  put_le32(f, UINT32_MAX);
+  put_le32(f, UINT32_MAX);
+  put_le16(f, (uint16_t)name_len);
+  put_le16(f, 20);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)local_offset);
+  fwrite(name, 1, name_len, f);
+  put_le16(f, 0x0001);
+  put_le16(f, 16);
+  put_le32(f, (uint32_t)data_len);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)data_len);
+  put_le32(f, 0);
+
+  long cd_size = (ftell(f) - zip_start) - cd_offset;
+  long zip64_eocd_offset = ftell(f) - zip_start;
+  put_le32(f, 0x06064b50U);
+  put_le32(f, 44);
+  put_le32(f, 0);
+  put_le16(f, 45);
+  put_le16(f, 45);
+  put_le32(f, 0);
+  put_le32(f, 0);
+  put_le32(f, 1);
+  put_le32(f, 0);
+  put_le32(f, 1);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)cd_size);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)cd_offset);
+  put_le32(f, 0);
+
+  long locator_offset = ftell(f) - zip_start;
+  long eocd_offset = locator_offset + 20;
+  long locator_target =
+      locator_points_to_eocd ? eocd_offset : zip64_eocd_offset;
+  put_le32(f, 0x07064b50U);
+  put_le32(f, 0);
+  put_le32(f, (uint32_t)locator_target);
+  put_le32(f, 0);
+  put_le32(f, 1);
+
+  put_le32(f, 0x06054b50U);
+  put_le16(f, 0);
+  put_le16(f, 0);
+  put_le16(f, UINT16_MAX);
+  put_le16(f, UINT16_MAX);
+  put_le32(f, UINT32_MAX);
+  put_le32(f, UINT32_MAX);
+  put_le16(f, 0);
+  return zip_start;
+}
+
 static char *make_temp_dir(const char *tag) {
   char tmpl[256];
   snprintf(tmpl, sizeof(tmpl), "/tmp/ntk-polyglot-zip-%s-XXXXXX", tag);
@@ -310,6 +404,19 @@ static char *make_polyglot_file(const char *tag, const char *entry,
   if (zip_start_out)
     *zip_start_out = (uint64_t)zip_start;
   return strdup(tmpl);
+}
+
+static int append_trailing_bytes(const char *path, size_t len) {
+  FILE *f = fopen(path, "ab");
+  if (!f)
+    return 0;
+  for (size_t i = 0; i < len; i++) {
+    if (fputc((int)('a' + (i % 26)), f) == EOF) {
+      fclose(f);
+      return 0;
+    }
+  }
+  return fclose(f) == 0;
 }
 
 static char *make_repeated_text(size_t len) {
@@ -370,6 +477,31 @@ static char *make_polyglot_file_entries(const char *tag,
     unlink(tmpl);
     return NULL;
   }
+  if (zip_start_out)
+    *zip_start_out = (uint64_t)zip_start;
+  return strdup(tmpl);
+}
+
+static char *make_polyglot_zip64_file(const char *tag, const char *entry,
+                                      const char *text,
+                                      int locator_points_to_eocd,
+                                      uint64_t *zip_start_out) {
+  char tmpl[256];
+  snprintf(tmpl, sizeof(tmpl), "/tmp/ntk-polyglot-zip-%s-XXXXXX.mp4", tag);
+  int fd = mkstemps(tmpl, 4);
+  if (fd < 0)
+    return NULL;
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    return NULL;
+  }
+  write_mp4_prefix(f);
+  long zip_start =
+      write_zip64_payload_with_eocd_locator(f, entry, text,
+                                            locator_points_to_eocd);
+  fclose(f);
   if (zip_start_out)
     *zip_start_out = (uint64_t)zip_start;
   return strdup(tmpl);
@@ -787,6 +919,51 @@ static void test_estimates_aes_zip_size_without_password(void) {
   free(workdir);
 }
 
+static void test_estimates_zip64_with_locator_pointing_at_eocd(void) {
+  uint64_t zip_start = 0;
+  const char *payload = "zip64 payload\n";
+  char *src = make_polyglot_zip64_file("zip64-eocd-locator", "large.bin",
+                                       payload, 1, &zip_start);
+  if (!src) {
+    fprintf(stderr, "zip64 eocd locator setup failed\n");
+    failures++;
+    return;
+  }
+
+  uint64_t total = polyglot_zip_estimate_uncompressed_size(src, zip_start);
+  if (total != strlen(payload)) {
+    fprintf(stderr, "ZIP64 EOCD locator fallback: expected %zu, got %llu\n",
+            strlen(payload), (unsigned long long)total);
+    failures++;
+  }
+
+  unlink(src);
+  free(src);
+}
+
+static void test_estimates_zip_size_with_trailing_bytes_after_eocd(void) {
+  uint64_t zip_start = 0;
+  const char *payload = "payload with trailing bytes\n";
+  char *src = make_polyglot_file("trailing-eocd", "payload.txt", payload, 0,
+                                 &zip_start);
+  if (!src || !append_trailing_bytes(src, 20480)) {
+    fprintf(stderr, "trailing EOCD fixture setup failed\n");
+    failures++;
+    free(src);
+    return;
+  }
+
+  uint64_t total = polyglot_zip_estimate_uncompressed_size(src, zip_start);
+  if (total != strlen(payload)) {
+    fprintf(stderr, "trailing EOCD estimate: expected %zu, got %llu\n",
+            strlen(payload), (unsigned long long)total);
+    failures++;
+  }
+
+  unlink(src);
+  free(src);
+}
+
 static void test_probes_aes_zip_password_at_offset(void) {
   uint64_t zip_start = 0;
   char *workdir = NULL;
@@ -828,6 +1005,8 @@ int main(void) {
   test_encrypted_flag_fails_without_output();
   test_extracts_aes_zip_with_password_without_copy();
   test_estimates_aes_zip_size_without_password();
+  test_estimates_zip64_with_locator_pointing_at_eocd();
+  test_estimates_zip_size_with_trailing_bytes_after_eocd();
   test_probes_aes_zip_password_at_offset();
   return failures == 0 ? 0 : 1;
 }

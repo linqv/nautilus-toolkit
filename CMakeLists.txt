@@ -97,6 +97,7 @@ add_library(nautilus-toolkit MODULE
     src/core/pwdlib.c
     src/core/encoding.c
     src/core/path.c
+    src/core/extract_outdir.c
     src/core/log.c
     src/core/strbuf.c
     src/core/fsutil.c
@@ -199,6 +200,18 @@ if(BUILD_TESTING)
         ${LIBARCHIVE_LIBRARIES}
     )
     add_test(NAME polyglot_zip_extract COMMAND test_polyglot_zip_extract)
+
+    add_executable(test_extract_outdir
+        tests/test_extract_outdir.c
+        src/core/path.c
+        src/core/extract_outdir.c
+        src/core/strbuf.c
+    )
+    target_include_directories(test_extract_outdir PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    )
+    target_link_libraries(test_extract_outdir PRIVATE ntk_warnings)
+    add_test(NAME extract_outdir COMMAND test_extract_outdir)
 
     add_executable(test_legacy_zip
         tests/test_legacy_zip.c

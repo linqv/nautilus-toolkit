@@ -635,6 +635,34 @@ static int zip_entry_name_looks_directory(int fd, uint64_t name_offset,
   return last == '/' || last == '\\';
 }
 
+static int normalize_zip_offset(uint64_t raw, uint64_t zip_start,
+                                uint64_t zip_size, uint64_t *logical_out) {
+  if (!logical_out)
+    return 0;
+  if (raw <= zip_size) {
+    *logical_out = raw;
+    return 1;
+  }
+  if (raw >= zip_start) {
+    uint64_t adjusted = raw - zip_start;
+    if (adjusted <= zip_size) {
+      *logical_out = adjusted;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int read_zip64_eocd_candidate(int fd, uint64_t zip_start,
+                                     uint64_t zip_size,
+                                     uint64_t logical_offset,
+                                     unsigned char zip64[56]) {
+  if (logical_offset > zip_size || zip_size - logical_offset < 56)
+    return 0;
+  return pread_full(fd, zip_start + logical_offset, zip64, 56) &&
+         zip_le32(zip64) == 0x06064b50U;
+}
+
 static uint64_t estimate_uncompressed_size_from_cd(int fd, uint64_t zip_start,
                                                    uint64_t zip_size) {
   if (zip_size < 22)
@@ -655,7 +683,7 @@ static uint64_t estimate_uncompressed_size_from_cd(int fd, uint64_t zip_start,
     if (scan[i] == 'P' && scan[i + 1] == 'K' && scan[i + 2] == 0x05 &&
         scan[i + 3] == 0x06) {
       uint16_t comment_len = zip_le16(scan + i + 20);
-      if (i + 22u + comment_len == scan_len) {
+      if (i + 22u + comment_len <= scan_len) {
         eocd_pos = i;
         break;
       }
@@ -686,23 +714,29 @@ static uint64_t estimate_uncompressed_size_from_cd(int fd, uint64_t zip_start,
   if (needs_zip64) {
     if (logical_eocd_offset < 20)
       return 0;
+    uint64_t locator_logical_offset = logical_eocd_offset - 20;
     unsigned char locator[20];
-    if (!pread_full(fd, zip_start + logical_eocd_offset - 20, locator,
+    if (!pread_full(fd, zip_start + locator_logical_offset, locator,
                     sizeof(locator)) ||
         zip_le32(locator) != 0x07064b50U) {
       return 0;
     }
     if (zip_le32(locator + 4) != 0 || zip_le32(locator + 16) > 1)
       return 0;
-    uint64_t zip64_eocd_offset = zip_le64(locator + 8);
-    if (zip64_eocd_offset > zip_size || zip_size - zip64_eocd_offset < 56)
-      return 0;
 
     unsigned char zip64[56];
-    if (!pread_full(fd, zip_start + zip64_eocd_offset, zip64, sizeof(zip64)) ||
-        zip_le32(zip64) != 0x06064b50U) {
-      return 0;
+    uint64_t zip64_eocd_offset = 0;
+    int have_zip64 = normalize_zip_offset(zip_le64(locator + 8), zip_start,
+                                          zip_size, &zip64_eocd_offset) &&
+                     read_zip64_eocd_candidate(fd, zip_start, zip_size,
+                                               zip64_eocd_offset, zip64);
+    if (!have_zip64 && locator_logical_offset >= 56) {
+      have_zip64 = read_zip64_eocd_candidate(
+          fd, zip_start, zip_size, locator_logical_offset - 56, zip64);
     }
+    if (!have_zip64)
+      return 0;
+
     if (zip_le32(zip64 + 16) != 0 || zip_le32(zip64 + 20) != 0)
       return 0;
     uint64_t entries_on_disk = zip_le64(zip64 + 24);
@@ -715,6 +749,10 @@ static uint64_t estimate_uncompressed_size_from_cd(int fd, uint64_t zip_start,
     return 0;
   }
 
+  if (cd_offset > zip_size &&
+      !normalize_zip_offset(cd_offset, zip_start, zip_size, &cd_offset)) {
+    return 0;
+  }
   if (cd_offset > zip_size || cd_size > zip_size - cd_offset)
     return 0;
 

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ui_gtk.h"
 #include "../core/exec7z.h"
+#include "../core/extract_outdir.h"
 #include "../core/extract_util.h"
 #include "../core/fsutil.h"
 #include "../core/log.h"
@@ -282,75 +283,6 @@ static int normalize_new_entries_from_snapshot(const char *dirpath,
 
   closedir(dir);
   return renamed;
-}
-
-static char *path_with_numeric_suffix(const char *path, int suffix) {
-  if (suffix <= 0)
-    return str_dup(path);
-
-  char buf[32];
-  snprintf(buf, sizeof(buf), "_%d", suffix);
-
-  StrBuf out;
-  sb_init(&out);
-  if (!sb_append(&out, path, strlen(path)) ||
-      !sb_append(&out, buf, strlen(buf))) {
-    sb_free(&out);
-    return NULL;
-  }
-  return out.data;
-}
-
-static int prepare_extract_outdir(char **outdir, const char *parent,
-                                  const char *custom_dest,
-                                  int *created_by_us,
-                                  int *existed_before) {
-  if (created_by_us)
-    *created_by_us = 0;
-  if (existed_before)
-    *existed_before = 0;
-  if (!outdir || !*outdir)
-    return 0;
-
-  if (custom_dest || !parent || strcmp(*outdir, parent) == 0) {
-    int existed = path_exists(*outdir);
-    int rc = mkdirs(*outdir);
-    if (rc != 0 && !path_exists(*outdir))
-      return 0;
-    if (existed_before)
-      *existed_before = existed;
-    return 1;
-  }
-
-  char *base = str_dup(*outdir);
-  if (!base)
-    return 0;
-
-  for (int i = 0; i <= 10000; i++) {
-    char *candidate = path_with_numeric_suffix(base, i);
-    if (!candidate)
-      break;
-
-    if (mkdir(candidate, 0755) == 0) {
-      free(*outdir);
-      *outdir = candidate;
-      free(base);
-      if (created_by_us)
-        *created_by_us = 1;
-      return 1;
-    }
-
-    if (errno == EEXIST) {
-      free(candidate);
-      continue;
-    }
-
-    free(candidate);
-    break;
-  }
-
-  free(base);
-  return 0;
 }
 
 /* ── Worker thread function ── */
@@ -637,7 +569,7 @@ gpointer ui_gtk_worker_func(gpointer data) {
         if (probe_hit >= 0 && !non_pwd_error &&
             !g_atomic_int_get(&ctx->cancelled)) {
           /* Only extract with the verified variant. */
-          if (!prepare_extract_outdir(&outdir, parent, custom_dest,
+          if (!prepare_extract_outdir(&outdir, parent, custom_dest, 0,
                                       &outdir_created_by_us,
                                       &outdir_existed_before)) {
             sb_append(&out, "无法创建输出目录", strlen("无法创建输出目录"));
@@ -683,7 +615,7 @@ gpointer ui_gtk_worker_func(gpointer data) {
         if (archive_waits_for_password) {
           sb_append(&out, "需要密码", strlen("需要密码"));
           last_ec = 255;
-        } else if (!prepare_extract_outdir(&outdir, parent, custom_dest,
+        } else if (!prepare_extract_outdir(&outdir, parent, custom_dest, 0,
                                            &outdir_created_by_us,
                                            &outdir_existed_before)) {
           sb_append(&out, "无法创建输出目录", strlen("无法创建输出目录"));
@@ -786,6 +718,7 @@ gpointer ui_gtk_worker_func(gpointer data) {
             int fast_outdir_created_by_us = 0;
             int fast_outdir_existed_before = 0;
             if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                       outdir_created_by_us,
                                        &fast_outdir_created_by_us,
                                        &fast_outdir_existed_before)) {
               pipe_writef(write_fd,
@@ -862,6 +795,7 @@ gpointer ui_gtk_worker_func(gpointer data) {
             int fast_outdir_created_by_us = 0;
             int fast_outdir_existed_before = 0;
             if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                       outdir_created_by_us,
                                        &fast_outdir_created_by_us,
                                        &fast_outdir_existed_before)) {
               pipe_writef(write_fd, "# 检测到 polyglot ZIP，使用快速模式\n");
@@ -949,6 +883,7 @@ gpointer ui_gtk_worker_func(gpointer data) {
               int fast_outdir_created_by_us = 0;
               int fast_outdir_existed_before = 0;
               if (prepare_extract_outdir(&outdir, parent, custom_dest,
+                                         outdir_created_by_us,
                                          &fast_outdir_created_by_us,
                                          &fast_outdir_existed_before)) {
                 pipe_writef(write_fd,
